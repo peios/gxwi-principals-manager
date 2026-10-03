@@ -1,0 +1,18 @@
+[package]
+name = "gxwi-principals-manager"
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+# Beside this checkout until a libgxwi with the dialog role is released.
+libgxwi = { path = "../gxwi/libgxwi" }
+# SIDs, read and written. The revision libgxwi pins, which it must:
+# `peios-sys` links libpeios, and a program can hold only one of it.
+peios = { git = "https://github.com/peios/peios-rs.git", rev = "3cf23f68d40c4adff252e28241bb3c958fba824f", package = "peios" }
+# What the principals are, from authd's identity socket, and what changes
+# them, on lpsd's admin socket: the protocols, and their clients. Beside
+# this checkout until they are pushed.
+libauthd = { path = "../authd/libauthd" }
+libauthd-client = { path = "../authd/libauthd-client" }

@@ -1,0 +1,7 @@
+# What Principals Manager is to a desktop (PGSS Applications): installed as
+# /usr/share/apps/dev.peios.gxwi-principals-manager.toml, named for the id,
+# by the package that installs the program. It is a window and nothing else:
+# what a terminal does with the local principals is lps's.
+title = "Principals Manager"
+description = "Manage this machine's users and groups"
+program = "/usr/bin/gxwi-principals-manager"
