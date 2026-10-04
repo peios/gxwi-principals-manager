@@ -12,6 +12,7 @@ use libauthd_client::admin::Admin;
 use libauthd_client::ident::Ident;
 use libgxwi::{App, Surface};
 
+mod accounts;
 mod directory;
 mod manager;
 mod words;

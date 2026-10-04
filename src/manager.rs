@@ -14,6 +14,7 @@ use libauthd_client::admin::Admin;
 use libauthd_client::ident::Ident;
 use libgxwi::{Facts, Fields as Typed, Live, Surface, Value as Pressed, escape};
 
+use crate::accounts::{self, Account, Doing};
 use crate::directory::{self, Directory, Members};
 use crate::words;
 
@@ -30,6 +31,10 @@ pub struct Manager {
     members: Option<Result<Vec<Record>, String>>,
     /// Whether this person may change the store, and why not.
     authority: Result<(), String>,
+    /// What is being done in the details pane.
+    doing: Doing,
+    /// What came of the last change: what was done, or why it wasn't.
+    said: Option<Result<String, String>>,
 }
 
 /// Which list is shown.
@@ -54,6 +59,8 @@ impl Manager {
             details: None,
             members: None,
             authority: Ok(()),
+            doing: Doing::Looking,
+            said: None,
         };
         manager.refresh();
         manager
@@ -138,6 +145,110 @@ impl Manager {
         self.pick(sid);
     }
 
+    /// The user picked, if they are a local one this person may change.
+    fn account(&self) -> Option<Account> {
+        let Some(Ok(record)) = &self.details else { return None };
+        let changeable = self.authority.is_ok() && record.kind_found == libauthd::ident::Kind::Principal && directory::local(&directory::sid_text(&record.sid));
+        changeable.then(|| Account::of(record))
+    }
+
+    /// Stops whatever was being done in the pane, forgetting any password
+    /// typed there.
+    fn leave(&mut self, fields: &mut Typed) {
+        self.doing = Doing::Looking;
+        self.said = None;
+        accounts::forget(fields);
+    }
+
+    /// What came of the last change, to show at the top of the pane.
+    fn said(&self) -> String {
+        match &self.said {
+            None => String::new(),
+            Some(Ok(done)) => format!("<p class=\"note\" role=\"status\">{}</p>", escape(done)),
+            Some(Err(why)) => format!("<p class=\"note bad\" role=\"alert\">{}</p>", escape(why)),
+        }
+    }
+
+    /// Notes what came of a change, and reads everything again so it shows.
+    fn changed(&mut self, outcome: Result<String, String>) {
+        if outcome.is_ok() {
+            self.doing = Doing::Looking;
+            self.refresh();
+        }
+        self.said = Some(outcome);
+    }
+
+    /// Does what the person asked of the user picked.
+    fn act(&mut self, name: &str, fields: &mut Typed) {
+        if name == "new" {
+            self.doing = Doing::New;
+            self.said = None;
+            accounts::clear(fields);
+            return;
+        }
+        if name == "save" && self.doing == Doing::New {
+            let made = accounts::create(&self.admin, fields);
+            accounts::forget(fields);
+            match made {
+                Ok((name, rid)) => {
+                    let sid = self.admin.domain().ok().map(|domain| format!("{}-{rid}", directory::sid_text(&domain)));
+                    self.changed(Ok(format!("{name} is made.")));
+                    accounts::clear(fields);
+                    if let Some(sid) = sid {
+                        self.show(&sid);
+                    }
+                }
+                Err(why) => self.said = Some(Err(why)),
+            }
+            return;
+        }
+        let Some(account) = self.account() else { return };
+        let admin = &self.admin;
+        match name {
+            "edit" | "rename" | "sign-in" | "password" => {
+                self.doing = match name {
+                    "edit" => Doing::Profile,
+                    "rename" => Doing::Rename,
+                    "sign-in" => Doing::SignIn,
+                    _ => Doing::Password(admin.show(&account.name).ok().and_then(|detail| detail.credential_policy)),
+                };
+                self.said = None;
+                accounts::fill(&self.doing, &account, fields);
+            }
+            "enable" | "disable" | "disable-instead" => {
+                let enabled = name == "enable";
+                let outcome = admin.set_enabled(&account.name, enabled).map(|()| format!("{} is {}.", account.name, if enabled { "enabled" } else { "disabled, and can't sign in" }));
+                self.changed(outcome.map_err(|refusal| refusal.reason));
+            }
+            "delete" => {
+                self.doing = Doing::Deleting;
+                self.said = None;
+            }
+            "delete-yes" => match admin.remove(&account.name) {
+                Ok(()) => {
+                    self.picked = None;
+                    self.changed(Ok(format!("{} is deleted.", account.name)));
+                }
+                Err(refusal) => {
+                    self.doing = Doing::Looking;
+                    self.said = Some(Err(refusal.reason));
+                }
+            },
+            "save" => {
+                let outcome = match &self.doing {
+                    Doing::Profile => accounts::save_profile(admin, &account, fields),
+                    Doing::Rename => accounts::save_rename(admin, &account, fields).map(|new_name| format!("{} is now called {new_name}.", account.name)),
+                    Doing::Password(policy) => accounts::save_password(admin, &account, *policy, fields),
+                    Doing::SignIn => accounts::save_sign_in(admin, &account, fields),
+                    _ => return,
+                };
+                accounts::forget(fields);
+                self.changed(outcome);
+            }
+            _ => {}
+        }
+    }
+
     fn matches(filter: &str, texts: &[&str]) -> bool {
         let filter = filter.trim().to_lowercase();
         filter.is_empty() || texts.iter().any(|text| text.to_lowercase().contains(&filter))
@@ -213,8 +324,17 @@ impl Manager {
         format!("<button type=\"button\" class=\"link\" fx-click=\"show\" fx-value-sid=\"{}\">{}</button>", escape(&sid), escape(&shown))
     }
 
-    fn details(&self) -> String {
+    fn details(&self, fields: &Typed) -> String {
+        if !matches!(self.doing, Doing::Looking | Doing::Deleting) {
+            let form = accounts::render(&self.doing, self.account().as_ref(), fields, &self.said());
+            if !form.is_empty() {
+                return form;
+            }
+        }
         let Some(details) = &self.details else {
+            if self.said.is_some() {
+                return format!("<aside class=\"details\" aria-label=\"Details\">{}</aside>", self.said());
+            }
             let what = match self.view {
                 View::Users => "Pick a user to see them in full.",
                 View::Groups => "Pick a group to see who is in it.",
@@ -223,7 +343,7 @@ impl Manager {
         };
         let record = match details {
             Ok(record) => record,
-            Err(why) => return format!("<aside class=\"details\" aria-label=\"Details\"><p class=\"note bad\">{}</p></aside>", escape(why)),
+            Err(why) => return format!("<aside class=\"details\" aria-label=\"Details\">{}<p class=\"note bad\">{}</p></aside>", self.said(), escape(why)),
         };
         let sid = directory::sid_text(&record.sid);
         let local = directory::local(&sid);
@@ -318,6 +438,21 @@ impl Manager {
         if !restricted.is_empty() {
             sections += &format!("<p class=\"note\">You may not see {}.</p>", escape(&restricted.join(", ")));
         }
+        let account = self.account();
+        let mut actions = String::new();
+        let mut asking = String::new();
+        if let Some(account) = &account {
+            let button = |event: &str, label: &str| format!("<button type=\"button\" fx-click=\"{event}\">{label}</button>");
+            actions += &button("edit", "Edit");
+            actions += &button("rename", "Rename");
+            actions += &button("password", "Set password");
+            actions += &button("sign-in", "Sign-in");
+            actions += &if account.enabled { button("disable", "Disable") } else { button("enable", "Enable") };
+            actions += "<button type=\"button\" class=\"danger\" fx-click=\"delete\">Delete</button>";
+            if self.doing == Doing::Deleting {
+                asking = accounts::asking_delete(account);
+            }
+        }
         let may = if !local {
             let said = if record.kind_found != libauthd::ident::Kind::Group {
                 "Built-in: authd defines it, and it can't be changed."
@@ -340,7 +475,8 @@ impl Manager {
         };
         format!(
             "<aside class=\"details\" aria-label=\"Details\"><h2>{title}</h2>{name}<dl>{facts}</dl>\
-             <p class=\"actions\"><button type=\"button\" fx-copy=\"sid\" fx-value-sid=\"{sid}\">Copy SID</button></p>{may}{sections}</aside>",
+             <p class=\"actions\">{actions}<button type=\"button\" fx-copy=\"sid\" fx-value-sid=\"{sid}\">Copy SID</button></p>{said}{asking}{may}{sections}</aside>",
+            said = self.said(),
             sid = escape(&sid),
         )
     }
@@ -370,37 +506,41 @@ impl Live for Manager {
             View::Users => "<div class=\"head\"><span>Name</span><span>Full name</span><span>Kind</span><span>State</span></div>",
             View::Groups => "<div class=\"head\"><span>Name</span><span>Kind</span><span>Members</span></div>",
         };
+        let new = if self.authority.is_ok() && self.view == View::Users {
+            "<button type=\"button\" fx-click=\"new\" fx-key=\"Ctrl+N\" title=\"A new user (Ctrl+N)\">New user</button>"
+        } else {
+            ""
+        };
         format!(
             "<div class=\"bar\"><div class=\"tabs\" role=\"group\" aria-label=\"Show\">{users}{groups}</div>\
              <input name=\"filter\" autocomplete=\"off\" spellcheck=\"false\" placeholder=\"Find by name or SID\" aria-label=\"Find\">\
-             <button type=\"button\" fx-click=\"refresh\" fx-key=\"F5\" title=\"Read again (F5)\">Refresh</button></div>{authority}\
+             {new}<button type=\"button\" fx-click=\"refresh\" fx-key=\"F5\" title=\"Read again (F5)\">Refresh</button></div>{authority}\
              <div class=\"body\"><div class=\"list {class}\">{head}{listing}</div>{details}</div>{footer}",
             users = tab(View::Users, "Users", "users"),
             groups = tab(View::Groups, "Groups", "groups"),
             class = if self.view == View::Users { "users" } else { "groups" },
             listing = self.listing(filter),
-            details = self.details(),
+            details = self.details(facts.fields),
             footer = self.footer(),
         )
     }
 
-    fn event(&mut self, name: &str, value: &Pressed, _fields: &mut Typed) {
+    fn event(&mut self, name: &str, value: &Pressed, fields: &mut Typed) {
         let sid = value["sid"].as_str().filter(|sid| !sid.is_empty());
         match name {
-            "users" => self.view = View::Users,
-            "groups" => self.view = View::Groups,
+            "users" | "groups" => {
+                self.leave(fields);
+                self.view = if name == "users" { View::Users } else { View::Groups };
+            }
             "refresh" => self.refresh(),
-            "pick" => {
+            "pick" | "show" => {
                 if let Some(sid) = sid {
-                    self.pick(sid);
+                    self.leave(fields);
+                    if name == "pick" { self.pick(sid) } else { self.show(sid) }
                 }
             }
-            "show" => {
-                if let Some(sid) = sid {
-                    self.show(sid);
-                }
-            }
-            _ => {}
+            "cancel" => self.leave(fields),
+            _ => self.act(name, fields),
         }
     }
 }
@@ -424,6 +564,8 @@ mod tests {
             details: None,
             members: None,
             authority: Ok(()),
+            doing: Doing::Looking,
+            said: None,
         }
     }
 
@@ -477,7 +619,7 @@ mod tests {
             ],
             withheld: vec![],
         }));
-        let details = manager.details();
+        let details = manager.details(&Typed::default());
         assert!(details.contains("<h2>Dana Scully</h2><p class=\"id\">dana</p>"));
         assert!(details.contains("<dt>User ID</dt><dd>1001002</dd>"));
         assert!(details.contains(r#"<li><button type="button" class="link" fx-click="show" fx-value-sid="S-1-5-32-544">Administrators</button></li>"#));
@@ -492,11 +634,42 @@ mod tests {
         let mut manager = seen(directory());
         manager.authority = Err(format!("You may look, but not change anything. {NEEDS}"));
         manager.details = Some(Ok(Record { sid: sid("S-1-5-21-1-2-3-1001"), qualified_name: "alice".into(), kind_found: Kind::Principal, values: vec![], withheld: vec![] }));
-        assert!(manager.details().contains("Changing users and groups needs Administrators, enabled in your token."));
+        assert!(manager.details(&Typed::default()).contains("Changing users and groups needs Administrators, enabled in your token."));
         manager.details = Some(Ok(Record { sid: sid("S-1-5-18"), qualified_name: "SYSTEM".into(), kind_found: Kind::Principal, values: vec![], withheld: vec![] }));
-        assert!(manager.details().contains("Built-in: authd defines it, and it can't be changed."));
+        assert!(manager.details(&Typed::default()).contains("Built-in: authd defines it, and it can't be changed."));
         manager.details = Some(Ok(Record { sid: sid("S-1-5-32-544"), qualified_name: "Administrators".into(), kind_found: Kind::Group, values: vec![], withheld: vec![] }));
-        assert!(manager.details().contains("who is in it is recorded on this machine"));
+        assert!(manager.details(&Typed::default()).contains("who is in it is recorded on this machine"));
+    }
+
+    #[test]
+    fn a_local_user_may_be_changed_only_by_someone_who_may() {
+        let mut manager = seen(directory());
+        let dana = Record { sid: sid("S-1-5-21-1-2-3-1002"), qualified_name: "dana".into(), kind_found: Kind::Principal, values: vec![Value::Enabled(true)], withheld: vec![] };
+        manager.details = Some(Ok(dana.clone()));
+        let shown = manager.details(&Typed::default());
+        assert!(shown.contains(r#"fx-click="rename""#) && shown.contains(r#"fx-click="disable""#), "{shown}");
+        manager.doing = Doing::Deleting;
+        assert!(manager.details(&Typed::default()).contains(r#"fx-click="disable-instead""#));
+        manager.doing = Doing::Rename;
+        assert!(manager.details(&Typed::default()).contains(r#"<input name="new-name""#));
+
+        manager.doing = Doing::Looking;
+        manager.authority = Err(format!("You may look, but not change anything. {NEEDS}"));
+        assert!(!manager.details(&Typed::default()).contains(r#"fx-click="rename""#));
+        manager.doing = Doing::Rename;
+        assert!(!manager.details(&Typed::default()).contains("new-name"), "no form for someone who may not use it");
+
+        manager.doing = Doing::Looking;
+        manager.authority = Ok(());
+        manager.details = Some(Ok(Record { sid: sid("S-1-5-18"), qualified_name: "SYSTEM".into(), kind_found: Kind::Principal, values: vec![], withheld: vec![] }));
+        assert!(!manager.details(&Typed::default()).contains(r#"fx-click="rename""#), "a built-in user is authd's");
+    }
+
+    #[test]
+    fn what_came_of_a_change_is_said_at_the_top_of_the_pane() {
+        let mut manager = seen(directory());
+        manager.said = Some(Err("dana is the only principal who can administer this machine".into()));
+        assert!(manager.details(&Typed::default()).contains(r#"<p class="note bad" role="alert">dana is the only principal"#));
     }
 
     #[test]
@@ -509,6 +682,6 @@ mod tests {
             values: vec![],
             withheld: vec![libauthd::ident::Withheld { field: Fields::MEMBERS, reason: WithheldReason::Absent }],
         }));
-        assert!(manager.details().contains("Its members are decided by a rule, not listed"));
+        assert!(manager.details(&Typed::default()).contains("Its members are decided by a rule, not listed"));
     }
 }
