@@ -68,7 +68,8 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent-soli
     padding: var(--space-1) var(--space-3);
 }
 .users .head, .users .entries button { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 80px 80px; }
-.groups .head, .groups .entries button { grid-template-columns: minmax(0, 2fr) 80px minmax(0, 1fr); }
+.groups .head, .groups .entries button { grid-template-columns: minmax(0, 1.4fr) 80px 90px minmax(0, 2fr); }
+.entries .about { font-size: 12px; color: var(--text-muted); }
 .head {
     flex: none;
     border-bottom: 1px solid var(--border-default);
@@ -136,6 +137,22 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent-soli
     cursor: pointer;
 }
 .details .link:hover { text-decoration: underline; }
+.details .about { margin: var(--space-2) 0 0; font-size: 12px; color: var(--text-secondary); }
+/* Remove, beside a group or a member. Always there, since a touch has no
+   hover to reveal it, and quiet until pointed at. */
+.details .plain li { display: flex; align-items: center; gap: var(--space-2); }
+.details button.small {
+    margin-left: auto;
+    padding: 0 var(--space-2);
+    height: 20px;
+    font-size: 11px;
+    color: var(--text-muted);
+    background: none;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+}
+.details button.small:hover { color: var(--danger-text); border-color: var(--danger-text); }
 .details .claims { margin: 0; padding: 0; list-style: none; font-size: 12px; }
 .details .claims li { display: grid; gap: 2px; padding: var(--space-2) 0; border-bottom: 1px solid var(--border-default); }
 .details .claims li:last-child { border-bottom: 0; }
@@ -150,7 +167,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent-soli
 .details .edit h2 + .id { margin-top: calc(-1 * var(--space-2)); }
 .details .edit label { display: flex; flex-direction: column; gap: var(--space-1); font-size: 12px; font-weight: 600; color: var(--text-secondary); }
 .details .edit label.check { flex-direction: row; align-items: center; gap: var(--space-2); font-weight: 500; color: var(--text-primary); }
-.details .edit input:not([type="checkbox"]):not([type="radio"]) {
+.details .edit input:not([type="checkbox"]):not([type="radio"]), .details .edit select {
     box-sizing: border-box;
     width: 100%;
     min-height: var(--control-sm);
@@ -209,6 +226,8 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent-soli
 @media (max-width: 860px) {
     .users .head, .users .entries button { grid-template-columns: minmax(0, 1fr) 80px; }
     .users .head span:nth-child(2), .users .entries .full, .users .head span:nth-child(3), .users .entries .kind { display: none; }
+    .groups .head, .groups .entries button { grid-template-columns: minmax(0, 2fr) 80px minmax(0, 1fr); }
+    .groups .head span:nth-child(4), .groups .entries .about { display: none; }
     .details { width: 260px; }
 }
 @media (max-width: 560px) {

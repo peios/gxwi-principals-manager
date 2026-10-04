@@ -16,7 +16,7 @@ use peios::security::SidRef;
 /// What is read of every user for the list.
 const USER_FIELDS: Fields = Fields(Fields::ENABLED.0 | Fields::DISPLAY_NAME.0 | Fields::UNIX_ID.0);
 /// What is read of every group for the list.
-const GROUP_FIELDS: Fields = Fields(Fields::UNIX_ID.0 | Fields::MEMBERS.0);
+const GROUP_FIELDS: Fields = Fields(Fields::UNIX_ID.0 | Fields::MEMBERS.0 | Fields::DESCRIPTION.0);
 
 /// One user, as the list shows them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +36,8 @@ pub struct Group {
     pub name: String,
     pub local: bool,
     pub members: Members,
+    /// Empty where it has none, or its source doesn't say.
+    pub description: String,
 }
 
 /// Who is in a group, as far as the list says.
@@ -97,6 +99,14 @@ fn display_name(record: &Record) -> String {
     }
 }
 
+/// What a group is for, or empty.
+pub fn description(record: &Record) -> String {
+    match record.value(Fields::DESCRIPTION) {
+        Some(Value::Description(text)) => text.clone(),
+        _ => String::new(),
+    }
+}
+
 /// What a group's record says of its members.
 pub fn members(record: &Record) -> Members {
     match (record.value(Fields::MEMBERS), record.reason(Fields::MEMBERS)) {
@@ -123,7 +133,7 @@ pub fn from_records(users: Vec<Record>, groups: Vec<Record>, incomplete: Vec<Str
         .into_iter()
         .map(|record| {
             let sid = sid_text(&record.sid);
-            Group { local: local(&sid), members: members(&record), name: record.qualified_name, sid }
+            Group { local: local(&sid), members: members(&record), description: description(&record), name: record.qualified_name, sid }
         })
         .collect();
     groups.sort_by_cached_key(|group| (group.local, group.name.to_lowercase()));
@@ -185,7 +195,7 @@ mod tests {
             record("alice", "S-1-5-21-1-2-3-1001", Kind::Principal, vec![Value::Enabled(false)], vec![]),
         ];
         let groups = vec![
-            record("staff", "S-1-5-21-1-2-3-1100", Kind::Group, vec![Value::Members(vec![Reference::default(), Reference::default()])], vec![]),
+            record("staff", "S-1-5-21-1-2-3-1100", Kind::Group, vec![Value::Members(vec![Reference::default(), Reference::default()]), Value::Description("Everyone who works here".into())], vec![]),
             record("Everyone", "S-1-1-0", Kind::Group, vec![], vec![Withheld { field: Fields::MEMBERS, reason: WithheldReason::Absent }]),
             record("Administrators", "S-1-5-32-544", Kind::Group, vec![], vec![Withheld { field: Fields::MEMBERS, reason: WithheldReason::TooLarge }]),
         ];
@@ -197,5 +207,7 @@ mod tests {
         assert_eq!(directory.users[1].display_name, "Dana Scully");
         let groups: Vec<(&str, &Members)> = directory.groups.iter().map(|group| (group.name.as_str(), &group.members)).collect();
         assert_eq!(groups, [("Administrators", &Members::Many), ("Everyone", &Members::Rule), ("staff", &Members::Counted(2))]);
+        assert_eq!(directory.groups[2].description, "Everyone who works here");
+        assert_eq!(directory.groups[0].description, "");
     }
 }

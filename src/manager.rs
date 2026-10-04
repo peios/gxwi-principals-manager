@@ -16,6 +16,7 @@ use libgxwi::{Facts, Fields as Typed, Live, Surface, Value as Pressed, escape};
 
 use crate::accounts::{self, Account, Doing};
 use crate::directory::{self, Directory, Members};
+use crate::groups::{self, Team};
 use crate::words;
 
 pub struct Manager {
@@ -178,33 +179,168 @@ impl Manager {
         self.said = Some(outcome);
     }
 
-    /// Does what the person asked of the user picked.
-    fn act(&mut self, name: &str, fields: &mut Typed) {
-        if name == "new" {
-            self.doing = Doing::New;
+    /// The group picked, if this person may change who is in it: a local
+    /// group, or a `BUILTIN` one, whose members are recorded here.
+    fn team(&self) -> Option<Team> {
+        let Some(Ok(record)) = &self.details else { return None };
+        let sid = directory::sid_text(&record.sid);
+        let changeable = self.authority.is_ok() && record.kind_found == libauthd::ident::Kind::Group && (directory::local(&sid) || directory::recorded(&sid));
+        changeable.then(|| Team::of(record))
+    }
+
+    /// The SIDs of the members of the group picked, as far as they are known.
+    fn member_sids(&self) -> Vec<String> {
+        match (&self.details, &self.members) {
+            (_, Some(Ok(members))) => members.iter().map(|member| directory::sid_text(&member.sid)).collect(),
+            (Some(Ok(record)), _) => match record.value(Fields::MEMBERS) {
+                Some(Value::Members(members)) => members.iter().map(|member| directory::sid_text(&member.sid)).collect(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        }
+    }
+
+    /// The groups a local user may be put in, by SID and name: this
+    /// machine's own, and the `BUILTIN` ones, whose members are recorded
+    /// here. `Authenticated Users` too where it may be a primary group.
+    fn joinable(&self, primary: bool) -> Vec<(String, String)> {
+        self.directory
+            .groups
+            .iter()
+            .filter(|group| group.local || directory::recorded(&group.sid) || (primary && group.sid == "S-1-5-11"))
+            .map(|group| (group.sid.clone(), group.name.clone()))
+            .collect()
+    }
+
+    /// The groups a form offers, for what is being done.
+    fn choices(&self) -> Vec<(String, String)> {
+        match &self.doing {
+            Doing::Profile => self.joinable(true),
+            Doing::Join => {
+                let joined: Vec<String> = match &self.details {
+                    Some(Ok(record)) => match record.value(Fields::GROUPS) {
+                        Some(Value::Groups(groups)) => groups.iter().map(|group| directory::sid_text(&group.sid)).collect(),
+                        _ => Vec::new(),
+                    },
+                    _ => Vec::new(),
+                };
+                self.joinable(false).into_iter().filter(|(sid, _)| !joined.contains(sid)).collect()
+            }
+            Doing::AddMember => {
+                let members = self.member_sids();
+                self.directory
+                    .users
+                    .iter()
+                    .filter(|user| user.local && !members.contains(&user.sid))
+                    .map(|user| {
+                        let name = accounts::short(&user.name).to_string();
+                        let shown = if user.display_name.is_empty() { name.clone() } else { format!("{name} ({})", user.display_name) };
+                        (name, shown)
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Makes what the new-user or new-group form describes, and shows it.
+    fn make(&mut self, fields: &mut Typed) {
+        let made = if self.doing == Doing::New { accounts::create(&self.admin, fields) } else { groups::create(&self.admin, fields) };
+        accounts::forget(fields);
+        match made {
+            Ok((name, rid)) => {
+                let sid = self.admin.domain().ok().map(|domain| format!("{}-{rid}", directory::sid_text(&domain)));
+                self.changed(Ok(format!("{name} is made.")));
+                accounts::clear(fields);
+                if let Some(sid) = sid {
+                    self.show(&sid);
+                }
+            }
+            Err(why) => self.said = Some(Err(why)),
+        }
+    }
+
+    /// Does what the person asked of the group picked.
+    fn act_on_group(&mut self, name: &str, value: &Pressed, fields: &mut Typed) {
+        let Some(team) = self.team() else { return };
+        let admin = &self.admin;
+        match name {
+            "edit-group" | "rename-group" | "add-member" | "delete-group" => {
+                self.doing = match name {
+                    "edit-group" if team.local => Doing::GroupEdit,
+                    "rename-group" if team.local => Doing::GroupRename,
+                    "delete-group" if team.local => Doing::GroupDeleting,
+                    "add-member" => Doing::AddMember,
+                    _ => return,
+                };
+                self.said = None;
+                groups::fill(&self.doing, &team, fields);
+            }
+            "delete-group-yes" if team.local => match admin.group_delete(&team.name) {
+                Ok(()) => {
+                    self.picked = None;
+                    self.changed(Ok(format!("{} is deleted.", team.name)));
+                }
+                Err(refusal) => {
+                    self.doing = Doing::Looking;
+                    self.said = Some(Err(refusal.reason));
+                }
+            },
+            "remove-member" => {
+                let Some(member) = value["member"].as_str().filter(|member| !member.is_empty()) else { return };
+                // A primary group is a membership no list holds, so taking
+                // them out of the list would leave them in it.
+                let primary = admin.show(member).is_ok_and(|detail| directory::sid_text(&detail.primary_group.sid) == team.sid);
+                if primary {
+                    self.said = Some(Err(format!("It is {member}'s primary group, so they are in it whatever else. Give them another under Edit first.")));
+                    return;
+                }
+                let outcome = admin.group_remove(member, &team.sid).map(|()| format!("{member} is out of {}. It applies from their next sign-in.", team.name));
+                self.changed(outcome.map_err(|refusal| refusal.reason));
+            }
+            "save" => {
+                let outcome = match &self.doing {
+                    Doing::GroupEdit => groups::save_description(admin, &team, fields),
+                    Doing::GroupRename => groups::save_rename(admin, &team, fields),
+                    Doing::AddMember => groups::save_member(admin, &team, fields),
+                    _ => return,
+                };
+                self.changed(outcome);
+            }
+            _ => {}
+        }
+    }
+
+    /// Does what the person asked: of the user or group picked, or a new one.
+    fn act(&mut self, name: &str, value: &Pressed, fields: &mut Typed) {
+        if name == "new" || name == "new-group" {
+            self.doing = if name == "new" { Doing::New } else { Doing::NewGroup };
             self.said = None;
             accounts::clear(fields);
             return;
         }
-        if name == "save" && self.doing == Doing::New {
-            let made = accounts::create(&self.admin, fields);
-            accounts::forget(fields);
-            match made {
-                Ok((name, rid)) => {
-                    let sid = self.admin.domain().ok().map(|domain| format!("{}-{rid}", directory::sid_text(&domain)));
-                    self.changed(Ok(format!("{name} is made.")));
-                    accounts::clear(fields);
-                    if let Some(sid) = sid {
-                        self.show(&sid);
-                    }
-                }
-                Err(why) => self.said = Some(Err(why)),
-            }
+        if name == "save" && matches!(self.doing, Doing::New | Doing::NewGroup) {
+            self.make(fields);
+            return;
+        }
+        if self.team().is_some() {
+            self.act_on_group(name, value, fields);
             return;
         }
         let Some(account) = self.account() else { return };
         let admin = &self.admin;
         match name {
+            "join" => {
+                self.doing = Doing::Join;
+                self.said = None;
+                accounts::fill(&self.doing, &account, fields);
+            }
+            "leave" => {
+                let Some(group) = value["group"].as_str().filter(|group| !group.is_empty()) else { return };
+                let called = value["called"].as_str().unwrap_or(group);
+                let outcome = admin.group_remove(&account.name, group).map(|()| format!("{} is out of {called}. It applies from their next sign-in.", account.name));
+                self.changed(outcome.map_err(|refusal| refusal.reason));
+            }
             "edit" | "rename" | "sign-in" | "password" => {
                 self.doing = match name {
                     "edit" => Doing::Profile,
@@ -240,6 +376,7 @@ impl Manager {
                     Doing::Rename => accounts::save_rename(admin, &account, fields).map(|new_name| format!("{} is now called {new_name}.", account.name)),
                     Doing::Password(policy) => accounts::save_password(admin, &account, *policy, fields),
                     Doing::SignIn => accounts::save_sign_in(admin, &account, fields),
+                    Doing::Join => accounts::save_join(admin, &account, fields),
                     _ => return,
                 };
                 accounts::forget(fields);
@@ -286,7 +423,7 @@ impl Manager {
                 .directory
                 .groups
                 .iter()
-                .filter(|group| Self::matches(filter, &[&group.name, &group.sid]))
+                .filter(|group| Self::matches(filter, &[&group.name, &group.sid, &group.description]))
                 .map(|group| {
                     let members = match &group.members {
                         Members::Counted(n) => words::count(*n, "member"),
@@ -296,12 +433,13 @@ impl Manager {
                     };
                     format!(
                         "<li><button type=\"button\" fx-click=\"pick\" fx-value-sid=\"{sid}\" aria-selected=\"{picked}\">\
-                         <span class=\"name\">{name}</span><span class=\"kind\">{kind}</span><span class=\"members\">{members}</span></button></li>",
+                         <span class=\"name\">{name}</span><span class=\"kind\">{kind}</span><span class=\"members\">{members}</span><span class=\"about\">{about}</span></button></li>",
                         sid = escape(&group.sid),
                         picked = self.picked.as_deref() == Some(group.sid.as_str()),
                         name = escape(&group.name),
                         kind = if group.local { "Local" } else { "Built-in" },
                         members = escape(&members),
+                        about = escape(&group.description),
                     )
                 })
                 .collect(),
@@ -325,8 +463,12 @@ impl Manager {
     }
 
     fn details(&self, fields: &Typed) -> String {
-        if !matches!(self.doing, Doing::Looking | Doing::Deleting) {
-            let form = accounts::render(&self.doing, self.account().as_ref(), fields, &self.said());
+        if !matches!(self.doing, Doing::Looking | Doing::Deleting | Doing::GroupDeleting) {
+            let choices = self.choices();
+            let mut form = accounts::render(&self.doing, self.account().as_ref(), fields, &self.said(), &choices);
+            if form.is_empty() {
+                form = groups::render(&self.doing, self.team().as_ref(), &self.said(), &choices);
+            }
             if !form.is_empty() {
                 return form;
             }
@@ -347,6 +489,12 @@ impl Manager {
         };
         let sid = directory::sid_text(&record.sid);
         let local = directory::local(&sid);
+        let account = self.account();
+        let team = self.team();
+        // A small button beside a group or a member, taking one out of the other.
+        let remove = |event: &str, values: &str, what: &str| {
+            format!("<button type=\"button\" class=\"small\" fx-click=\"{event}\"{values} title=\"{}\">Remove</button>", escape(what))
+        };
         let row = |name: &str, value: &str| format!("<dt>{name}</dt><dd>{value}</dd>");
         let mut facts = String::new();
         let mut sections = String::new();
@@ -378,7 +526,22 @@ impl Manager {
             sections += &format!("<h3>May sign in</h3><ul class=\"plain\">{said}</ul>{default}");
         }
         if let Some(Value::Groups(groups)) = record.value(Fields::GROUPS) {
-            let listed: String = groups.iter().map(|group| format!("<li>{}</li>", Self::reference(&group.sid, &group.name))).collect();
+            let listed: String = groups
+                .iter()
+                .map(|group| {
+                    let at = directory::sid_text(&group.sid);
+                    let out = if account.is_some() && (directory::local(&at) || directory::recorded(&at)) {
+                        remove(
+                            "leave",
+                            &format!(" fx-value-group=\"{}\" fx-value-called=\"{}\"", escape(&at), escape(&group.name)),
+                            &format!("Take them out of {}", group.name),
+                        )
+                    } else {
+                        String::new()
+                    };
+                    format!("<li>{}{out}</li>", Self::reference(&group.sid, &group.name))
+                })
+                .collect();
             sections += &if groups.is_empty() {
                 "<h3>Groups</h3><p class=\"more\">In no groups but their primary group.</p>".to_string()
             } else {
@@ -386,16 +549,22 @@ impl Manager {
             };
         }
         if record.kind_found == libauthd::ident::Kind::Group {
+            // A member lpsd holds may be taken out; one of another source is
+            // that source's to change.
+            let member = |at: &[u8], name: &str| {
+                let out = if team.is_some() && directory::local(&directory::sid_text(at)) {
+                    let short = accounts::short(name);
+                    remove("remove-member", &format!(" fx-value-member=\"{}\"", escape(short)), &format!("Take {short} out of it"))
+                } else {
+                    String::new()
+                };
+                format!("<li>{}{out}</li>", Self::reference(at, name))
+            };
             sections += "<h3>Members</h3>";
             sections += &match (record.value(Fields::MEMBERS), &self.members, directory::members(record)) {
                 (Some(Value::Members(members)), _, _) if members.is_empty() => "<p class=\"more\">Nobody is in it.</p>".to_string(),
-                (Some(Value::Members(members)), _, _) => {
-                    format!("<ul class=\"plain\">{}</ul>", members.iter().map(|member| format!("<li>{}</li>", Self::reference(&member.sid, &member.name))).collect::<String>())
-                }
-                (_, Some(Ok(members)), _) => format!(
-                    "<ul class=\"plain\">{}</ul>",
-                    members.iter().map(|member| format!("<li>{}</li>", Self::reference(&member.sid, &member.qualified_name))).collect::<String>()
-                ),
+                (Some(Value::Members(members)), _, _) => format!("<ul class=\"plain\">{}</ul>", members.iter().map(|m| member(&m.sid, &m.name)).collect::<String>()),
+                (_, Some(Ok(members)), _) => format!("<ul class=\"plain\">{}</ul>", members.iter().map(|m| member(&m.sid, &m.qualified_name)).collect::<String>()),
                 (_, Some(Err(why)), _) => format!("<p class=\"note bad\">{}</p>", escape(why)),
                 (_, None, Members::Rule) => "<p class=\"more\">Its members are decided by a rule, not listed: everyone it describes is in it as they sign in.</p>".to_string(),
                 (_, None, Members::Unsaid(why)) => format!("<p class=\"more\">{}</p>", escape(&why)),
@@ -438,21 +607,38 @@ impl Manager {
         if !restricted.is_empty() {
             sections += &format!("<p class=\"note\">You may not see {}.</p>", escape(&restricted.join(", ")));
         }
-        let account = self.account();
         let mut actions = String::new();
         let mut asking = String::new();
+        let button = |event: &str, label: &str| format!("<button type=\"button\" fx-click=\"{event}\">{label}</button>");
         if let Some(account) = &account {
-            let button = |event: &str, label: &str| format!("<button type=\"button\" fx-click=\"{event}\">{label}</button>");
             actions += &button("edit", "Edit");
             actions += &button("rename", "Rename");
             actions += &button("password", "Set password");
             actions += &button("sign-in", "Sign-in");
+            actions += &button("join", "Add to group");
             actions += &if account.enabled { button("disable", "Disable") } else { button("enable", "Enable") };
             actions += "<button type=\"button\" class=\"danger\" fx-click=\"delete\">Delete</button>";
             if self.doing == Doing::Deleting {
                 asking = accounts::asking_delete(account);
             }
         }
+        if let Some(team) = &team {
+            if team.local {
+                actions += &button("edit-group", "Edit");
+                actions += &button("rename-group", "Rename");
+            }
+            actions += &button("add-member", "Add member");
+            if team.local {
+                actions += "<button type=\"button\" class=\"danger\" fx-click=\"delete-group\">Delete</button>";
+                if self.doing == Doing::GroupDeleting {
+                    asking = groups::asking_delete(team, self.member_sids().len());
+                }
+            }
+        }
+        let about = match record.value(Fields::DESCRIPTION) {
+            Some(Value::Description(text)) if !text.is_empty() => format!("<p class=\"about\">{}</p>", escape(text)),
+            _ => String::new(),
+        };
         let may = if !local {
             let said = if record.kind_found != libauthd::ident::Kind::Group {
                 "Built-in: authd defines it, and it can't be changed."
@@ -474,7 +660,7 @@ impl Manager {
             None => (escape(&record.qualified_name), String::new()),
         };
         format!(
-            "<aside class=\"details\" aria-label=\"Details\"><h2>{title}</h2>{name}<dl>{facts}</dl>\
+            "<aside class=\"details\" aria-label=\"Details\"><h2>{title}</h2>{name}{about}<dl>{facts}</dl>\
              <p class=\"actions\">{actions}<button type=\"button\" fx-copy=\"sid\" fx-value-sid=\"{sid}\">Copy SID</button></p>{said}{asking}{may}{sections}</aside>",
             said = self.said(),
             sid = escape(&sid),
@@ -504,12 +690,12 @@ impl Live for Manager {
         };
         let head = match self.view {
             View::Users => "<div class=\"head\"><span>Name</span><span>Full name</span><span>Kind</span><span>State</span></div>",
-            View::Groups => "<div class=\"head\"><span>Name</span><span>Kind</span><span>Members</span></div>",
+            View::Groups => "<div class=\"head\"><span>Name</span><span>Kind</span><span>Members</span><span>Description</span></div>",
         };
-        let new = if self.authority.is_ok() && self.view == View::Users {
-            "<button type=\"button\" fx-click=\"new\" fx-key=\"Ctrl+N\" title=\"A new user (Ctrl+N)\">New user</button>"
-        } else {
-            ""
+        let new = match (&self.authority, self.view) {
+            (Ok(()), View::Users) => "<button type=\"button\" fx-click=\"new\" fx-key=\"Ctrl+N\" title=\"A new user (Ctrl+N)\">New user</button>",
+            (Ok(()), View::Groups) => "<button type=\"button\" fx-click=\"new-group\" fx-key=\"Ctrl+N\" title=\"A new group (Ctrl+N)\">New group</button>",
+            (Err(_), _) => "",
         };
         format!(
             "<div class=\"bar\"><div class=\"tabs\" role=\"group\" aria-label=\"Show\">{users}{groups}</div>\
@@ -540,7 +726,7 @@ impl Live for Manager {
                 }
             }
             "cancel" => self.leave(fields),
-            _ => self.act(name, fields),
+            _ => self.act(name, value, fields),
         }
     }
 }
@@ -580,7 +766,11 @@ mod tests {
                 User { sid: "S-1-5-21-1-2-3-1002".into(), name: "dana".into(), display_name: "Dana Scully".into(), enabled: Some(true), local: true },
                 User { sid: "S-1-5-18".into(), name: "SYSTEM".into(), display_name: String::new(), enabled: None, local: false },
             ],
-            groups: vec![Group { sid: "S-1-5-32-544".into(), name: "Administrators".into(), local: false, members: Members::Counted(1) }],
+            groups: vec![
+                Group { sid: "S-1-5-32-544".into(), name: "Administrators".into(), local: false, members: Members::Counted(1), description: "May change anything".into() },
+                Group { sid: "S-1-5-21-1-2-3-1100".into(), name: "developers".into(), local: true, members: Members::Counted(0), description: String::new() },
+                Group { sid: "S-1-1-0".into(), name: "Everyone".into(), local: false, members: Members::Rule, description: String::new() },
+            ],
             incomplete: Vec::new(),
             trouble: None,
         }
@@ -622,7 +812,7 @@ mod tests {
         let details = manager.details(&Typed::default());
         assert!(details.contains("<h2>Dana Scully</h2><p class=\"id\">dana</p>"));
         assert!(details.contains("<dt>User ID</dt><dd>1001002</dd>"));
-        assert!(details.contains(r#"<li><button type="button" class="link" fx-click="show" fx-value-sid="S-1-5-32-544">Administrators</button></li>"#));
+        assert!(details.contains(r#"<li><button type="button" class="link" fx-click="show" fx-value-sid="S-1-5-32-544">Administrators</button><button type="button" class="small" fx-click="leave" fx-value-group="S-1-5-32-544" fx-value-called="Administrators" title="Take them out of Administrators">Remove</button></li>"#), "{details}");
         assert!(details.contains("Nothing is stated, so the machine's default applies."));
         manager.show("S-1-5-32-544");
         assert_eq!(manager.view, View::Groups);
@@ -663,6 +853,61 @@ mod tests {
         manager.authority = Ok(());
         manager.details = Some(Ok(Record { sid: sid("S-1-5-18"), qualified_name: "SYSTEM".into(), kind_found: Kind::Principal, values: vec![], withheld: vec![] }));
         assert!(!manager.details(&Typed::default()).contains(r#"fx-click="rename""#), "a built-in user is authd's");
+    }
+
+    fn group(at: &str, name: &str, values: Vec<Value>) -> Record {
+        Record { sid: sid(at), qualified_name: name.into(), kind_found: Kind::Group, values, withheld: vec![] }
+    }
+
+    fn member(at: &str, name: &str) -> Reference {
+        Reference { sid: sid(at), name: name.into(), unix_id: 0 }
+    }
+
+    #[test]
+    fn a_local_group_may_be_changed_a_builtin_one_only_in_its_members_and_a_rule_not_at_all() {
+        let mut manager = seen(directory());
+        manager.details = Some(Ok(group(
+            "S-1-5-21-1-2-3-1100",
+            "developers",
+            vec![Value::Members(vec![member("S-1-5-21-1-2-3-1002", "dana")]), Value::Description("Builds the software".into())],
+        )));
+        let shown = manager.details(&Typed::default());
+        assert!(shown.contains(r#"<p class="about">Builds the software</p>"#), "{shown}");
+        for event in ["edit-group", "rename-group", "add-member", "delete-group"] {
+            assert!(shown.contains(&format!("fx-click=\"{event}\"")), "{event}: {shown}");
+        }
+        assert!(shown.contains(r#"fx-click="remove-member" fx-value-member="dana""#), "{shown}");
+        // Only alice may be added: dana is in it, and SYSTEM is not lpsd's.
+        manager.doing = Doing::AddMember;
+        assert_eq!(manager.choices(), vec![("alice".to_string(), "alice".to_string())]);
+        manager.doing = Doing::GroupDeleting;
+        assert!(manager.details(&Typed::default()).contains("has 1 member"));
+
+        manager.doing = Doing::Looking;
+        manager.details = Some(Ok(group("S-1-5-32-544", "Administrators", vec![Value::Members(vec![member("S-1-5-21-1-2-3-1002", "dana")])])));
+        let shown = manager.details(&Typed::default());
+        assert!(shown.contains(r#"fx-click="add-member""#) && shown.contains(r#"fx-click="remove-member""#));
+        assert!(!shown.contains(r#"fx-click="rename-group""#) && !shown.contains(r#"fx-click="delete-group""#));
+
+        manager.details = Some(Ok(group("S-1-1-0", "Everyone", vec![])));
+        assert!(!manager.details(&Typed::default()).contains(r#"fx-click="add-member""#));
+    }
+
+    #[test]
+    fn a_user_is_offered_the_groups_they_could_join_and_be_primary_in() {
+        let mut manager = seen(directory());
+        manager.details = Some(Ok(Record {
+            sid: sid("S-1-5-21-1-2-3-1002"),
+            qualified_name: "dana".into(),
+            kind_found: Kind::Principal,
+            values: vec![Value::Groups(vec![member("S-1-5-32-544", "Administrators")])],
+            withheld: vec![],
+        }));
+        manager.doing = Doing::Join;
+        assert_eq!(manager.choices(), vec![("S-1-5-21-1-2-3-1100".to_string(), "developers".to_string())]);
+        manager.doing = Doing::Profile;
+        let primaries: Vec<String> = manager.choices().into_iter().map(|(_, name)| name).collect();
+        assert_eq!(primaries, ["Administrators", "developers"], "never a rule group such as Everyone");
     }
 
     #[test]

@@ -14,6 +14,7 @@ use libgxwi::{App, Surface};
 
 mod accounts;
 mod directory;
+mod groups;
 mod manager;
 mod words;
 

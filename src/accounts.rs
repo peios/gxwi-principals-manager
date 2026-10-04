@@ -15,6 +15,7 @@ use libauthd::lps::{self, LogonTypes};
 use libauthd_client::admin::Admin;
 use libgxwi::{Fields, escape};
 
+use crate::directory;
 use crate::words;
 
 /// What is being done in the details pane.
@@ -33,6 +34,17 @@ pub enum Doing {
     SignIn,
     /// Asking before the user is deleted.
     Deleting,
+    /// A group for the picked user to join.
+    Join,
+    /// A new local group.
+    NewGroup,
+    /// The picked group's description.
+    GroupEdit,
+    GroupRename,
+    /// Asking before the picked group is deleted.
+    GroupDeleting,
+    /// A user to put in the picked group.
+    AddMember,
 }
 
 /// The fields a password is typed in, cleared whenever a form is left.
@@ -48,6 +60,8 @@ pub struct Account {
     pub shell: String,
     pub enabled: bool,
     pub types: LogonTypes,
+    /// Their primary group's SID, as text; empty where it wasn't said.
+    pub primary: String,
 }
 
 impl Account {
@@ -66,6 +80,10 @@ impl Account {
                 Some(Value::LogonTypes(types)) => *types,
                 _ => LogonTypes::UNSTATED,
             },
+            primary: match record.value(Asked::PRIMARY_GROUP) {
+                Some(Value::PrimaryGroup(group)) => directory::sid_text(&group.sid),
+                _ => String::new(),
+            },
         }
     }
 
@@ -83,7 +101,7 @@ pub fn short(qualified: &str) -> &str {
 
 /// Empties the fields a form fills, so each starts afresh.
 pub fn clear(fields: &mut Fields) {
-    for name in ["name", "full", "home", "shell", "no-password", "administrator", "new-name", "which"] {
+    for name in ["name", "full", "home", "shell", "no-password", "administrator", "new-name", "which", "primary", "description", "member", "group"] {
         fields.set(name, "");
     }
     forget(fields);
@@ -107,6 +125,7 @@ pub fn fill(doing: &Doing, account: &Account, fields: &mut Fields) {
             fields.set("full", &account.full);
             fields.set("home", &account.home);
             fields.set("shell", &account.shell);
+            fields.set("primary", &account.primary);
         }
         Doing::Rename => fields.set("new-name", &account.name),
         Doing::SignIn => {
@@ -128,8 +147,11 @@ fn buttons(save: &str) -> String {
     )
 }
 
-fn form(label: &str, title: &str, id: &str, body: &str, save: &str) -> String {
-    let id = if id.is_empty() { String::new() } else { format!("<p class=\"id\">{}</p>", escape(id)) };
+/// A form in the details pane: its title, the name below it where there is
+/// one, its fields and its buttons.
+pub fn form(label: &str, title: &str, id: &str, body: &str, save: &str) -> String {
+    // The name below the title only where the title is something else.
+    let id = if id.is_empty() || id == title { String::new() } else { format!("<p class=\"id\">{}</p>", escape(id)) };
     format!(
         "<aside class=\"details\" aria-label=\"{label}\"><form class=\"edit\" fx-submit=\"save\"><h2>{title}</h2>{id}{body}{}</form></aside>",
         buttons(save),
@@ -137,9 +159,15 @@ fn form(label: &str, title: &str, id: &str, body: &str, save: &str) -> String {
     )
 }
 
+/// A list's options: each group's SID as its value, and its name shown.
+pub fn options(choices: &[(String, String)]) -> String {
+    choices.iter().map(|(sid, name)| format!("<option value=\"{}\">{}</option>", escape(sid), escape(name))).collect()
+}
+
 /// The form for what is being done, for `account` where there is one, with
 /// what came of saving it just above its buttons, where it was pressed.
-pub fn render(doing: &Doing, account: Option<&Account>, fields: &Fields, said: &str) -> String {
+/// `choices` are the groups the form may offer, by SID and name.
+pub fn render(doing: &Doing, account: Option<&Account>, fields: &Fields, said: &str, choices: &[(String, String)]) -> String {
     let form = |label: &str, title: &str, id: &str, body: &str, save: &str| form(label, title, id, &format!("{body}{said}"), save);
     match (doing, account) {
         (Doing::New, _) => form(
@@ -163,11 +191,34 @@ pub fn render(doing: &Doing, account: Option<&Account>, fields: &Fields, said: &
             "Edit the user",
             account.called(),
             &account.name,
-            "<label>Full name<input name=\"full\" autocomplete=\"off\" fx-autofocus></label>\
-             <label>Home<input name=\"home\" autocomplete=\"off\" spellcheck=\"false\"></label>\
-             <p class=\"hint\">Where they start when they sign in. The folder is made at their first sign-in, and not moved if this changes.</p>\
-             <label>Shell<input name=\"shell\" autocomplete=\"off\" spellcheck=\"false\"></label>",
+            &format!(
+                "<label>Full name<input name=\"full\" autocomplete=\"off\" fx-autofocus></label>\
+                 <label>Home<input name=\"home\" autocomplete=\"off\" spellcheck=\"false\"></label>\
+                 <p class=\"hint\">Where they start when they sign in. The folder is made at their first sign-in, and not moved if this changes.</p>\
+                 <label>Shell<input name=\"shell\" autocomplete=\"off\" spellcheck=\"false\"></label>\
+                 <label>Primary group<select name=\"primary\">{}</select></label>\
+                 <p class=\"hint\">The group their new files belong to. They are in it, whatever their other groups.</p>",
+                options(choices),
+            ),
             "Save",
+        ),
+        (Doing::Join, Some(account)) if choices.is_empty() => form(
+            "Add the user to a group",
+            account.called(),
+            &account.name,
+            "<p class=\"more\">They are in every group they could be put in already.</p>",
+            "Add",
+        ),
+        (Doing::Join, Some(account)) => form(
+            "Add the user to a group",
+            account.called(),
+            &account.name,
+            &format!(
+                "<label>Add them to<select name=\"group\" fx-autofocus>{}</select></label>\
+                 <p class=\"hint\">It applies from their next sign-in.</p>",
+                options(choices),
+            ),
+            "Add",
         ),
         (Doing::Rename, Some(account)) => form(
             "Rename the user",
@@ -309,11 +360,27 @@ pub fn save_profile(admin: &Admin, account: &Account, fields: &Fields) -> Result
         home: changed(fields.get("home"), &account.home),
         shell: changed(fields.get("shell"), &account.shell),
     };
-    if profile.display_name.is_none() && profile.home.is_none() && profile.shell.is_none() {
+    let primary = changed(fields.get("primary"), &account.primary).filter(|primary| !primary.is_empty());
+    if profile.display_name.is_none() && profile.home.is_none() && profile.shell.is_none() && primary.is_none() {
         return Ok("Nothing was changed.".into());
     }
-    admin.set_profile(&profile).map_err(|refusal| refusal.reason)?;
+    if profile.display_name.is_some() || profile.home.is_some() || profile.shell.is_some() {
+        admin.set_profile(&profile).map_err(|refusal| refusal.reason)?;
+    }
+    if let Some(primary) = primary {
+        admin.set_primary_group(&account.name, &primary).map_err(|refusal| refusal.reason)?;
+    }
     Ok(format!("{} is changed.", account.name))
+}
+
+/// Saves the form adding the user to a group, sent as its SID.
+pub fn save_join(admin: &Admin, account: &Account, fields: &Fields) -> Result<String, String> {
+    let group = fields.get("group");
+    if group.is_empty() {
+        return Err("Choose a group.".into());
+    }
+    admin.group_add(&account.name, group).map_err(|refusal| refusal.reason)?;
+    Ok(format!("{} is added. It applies from their next sign-in.", account.name))
 }
 
 /// Saves the rename form. Answers the new name.
@@ -377,6 +444,7 @@ mod tests {
             shell: "/bin/sh".into(),
             enabled: true,
             types: LogonTypes::UNSTATED,
+            primary: "S-1-5-11".into(),
         }
     }
 
@@ -425,7 +493,7 @@ mod tests {
         assert_eq!(chosen_types(&fields).unwrap(), LogonTypes::UNSTATED);
         // The default's ways are ticked, ready to narrow.
         assert_eq!(fields.get("type-0"), "on");
-        assert!(render(&Doing::SignIn, Some(&dana()), &fields, "").contains("name=\"type-0\" disabled"));
+        assert!(render(&Doing::SignIn, Some(&dana()), &fields, "", &[]).contains("name=\"type-0\" disabled"));
 
         fields.set("which", "chosen");
         for index in 0..words::LOGON_TYPES.len() {
@@ -440,9 +508,9 @@ mod tests {
     #[test]
     fn the_new_user_form_asks_for_a_password_unless_none_is_needed() {
         let mut fields = Fields::default();
-        assert!(render(&Doing::New, None, &fields, "").contains("type=\"password\" name=\"password\""));
+        assert!(render(&Doing::New, None, &fields, "", &[]).contains("type=\"password\" name=\"password\""));
         fields.set("no-password", "on");
-        assert!(!render(&Doing::New, None, &fields, "").contains("type=\"password\""));
+        assert!(!render(&Doing::New, None, &fields, "", &[]).contains("type=\"password\""));
     }
 
     #[test]
