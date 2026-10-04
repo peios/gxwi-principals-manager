@@ -75,7 +75,9 @@ pub fn notes(policy: &Policy) -> String {
                   it is the whole policy.</p>";
     }
     for problem in &policy.problems {
-        notes += &format!("<p class=\"said bad\" role=\"alert\">authd ignores this: {}</p>", escape(problem));
+        // Each problem says what authd does about it: ignores a record, or
+        // applies two where one was meant.
+        notes += &format!("<p class=\"said bad\" role=\"alert\">authd warns: {}</p>", escape(problem));
     }
     notes
 }
@@ -465,7 +467,7 @@ mod tests {
         let lpsd = libauthd_policy::service_sid::of("lpsd").unwrap();
         known.services.push((lpsd.to_string(), "lpsd".into()));
         assert_eq!(called(lpsd.as_ref(), &known), "The lpsd service");
-        assert!(notes(&policy()).contains("authd ignores this: ignoring policy record"));
+        assert!(notes(&policy()).contains("authd warns: ignoring policy record"));
         assert!(notes(&Policy::floor()).contains("no policy key"));
     }
 
