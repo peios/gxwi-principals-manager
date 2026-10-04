@@ -18,9 +18,10 @@ mod directory;
 mod groups;
 mod keys;
 mod manager;
+mod policy;
 mod words;
 
-use manager::Manager;
+use manager::{Heard, Manager};
 
 // What this program looks like, to whatever lists it. The icon itself is
 // `gxwi-principals-manager.svg` at the repo root, installed as the base
@@ -41,16 +42,20 @@ fn look_again(window: Weak<Surface<Manager>>) {
             (manager.ident().clone(), manager.admin().clone(), manager.picked().map(str::to_string), manager.local_user())
         });
         drop(shown);
-        let read = directory::read(&ident);
-        let details = picked.as_deref().map(|sid| directory::details(&ident, sid));
-        // Keys and how they sign in are lpsd's, asked of it only where this
-        // person may administer it.
-        let credentials = user.map(|name| admin.keys(&name).map_err(|refusal| refusal.reason));
+        let heard = Heard {
+            directory: directory::read(&ident),
+            details: picked.as_deref().map(|sid| directory::details(&ident, sid)),
+            // Keys and how they sign in are lpsd's, asked of it only where
+            // this person may administer it.
+            credentials: user.map(|name| admin.keys(&name).map_err(|refusal| refusal.reason)),
+            policy: libauthd_policy::Policy::read(),
+            picked,
+        };
         let Some(shown) = window.upgrade() else { return };
         // An update shows every page the window again, so only one that
         // changes something is made.
-        if shown.look(|manager, _, _| manager.differs(&read, picked.as_deref(), details.as_ref(), credentials.as_ref())) {
-            shown.update(|manager, _| manager.heard(read, picked.as_deref(), details, credentials));
+        if shown.look(|manager, _, _| manager.differs(&heard)) {
+            shown.update(|manager, _| manager.heard(heard));
         }
     }
 }

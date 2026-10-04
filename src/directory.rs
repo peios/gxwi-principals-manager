@@ -63,6 +63,9 @@ pub struct Directory {
     pub incomplete: Vec<String>,
     /// Why the lists couldn't be read at all.
     pub trouble: Option<String>,
+    /// This machine's services, by their SIDs, each derived from its name
+    /// as authd derives it: what a policy record for a service is named by.
+    pub services: Vec<(String, String)>,
 }
 
 impl Directory {
@@ -148,14 +151,14 @@ pub fn from_records(users: Vec<Record>, groups: Vec<Record>, incomplete: Vec<Str
         })
         .collect();
     groups.sort_by_cached_key(|group| (group.local, group.name.to_lowercase()));
-    Directory { users, groups, incomplete, trouble: None }
+    Directory { users, groups, incomplete, trouble: None, services: Vec::new() }
 }
 
-/// Reads every user and group.
+/// Reads every user and group, and the services there are.
 pub fn read(ident: &Ident) -> Directory {
     let users = ident.enumerate(Kind::Principal, USER_FIELDS, None);
     let groups = ident.enumerate(Kind::Group, GROUP_FIELDS, None);
-    match (users, groups) {
+    let mut directory = match (users, groups) {
         (Ok(users), Ok(groups)) => {
             let mut incomplete = users.incomplete;
             for source in groups.incomplete {
@@ -166,7 +169,25 @@ pub fn read(ident: &Ident) -> Directory {
             from_records(users.records, groups.records, incomplete)
         }
         (Err(e), _) | (_, Err(e)) => Directory { trouble: Some(format!("The principals could not be read: {e}.")), ..Directory::default() },
-    }
+    };
+    directory.services = services();
+    directory
+}
+
+/// Where services are defined, one subkey each, named by the service.
+const SERVICES: &str = "Machine\\System\\Services";
+
+/// Each service there is, by its SID, and its name. A service whose key
+/// can't be listed is simply not named: its records show their SIDs.
+fn services() -> Vec<(String, String)> {
+    let Ok(key) = peios::registry::Key::open(None, SERVICES, peios::registry::KeyAccess::ENUMERATE_SUB_KEYS, peios::registry::OpenFlags::empty()) else {
+        return Vec::new();
+    };
+    key.subkeys(None)
+        .filter_map(Result::ok)
+        .filter_map(|subkey| String::from_utf8(subkey.name).ok())
+        .filter_map(|name| Some((libauthd_policy::service_sid::of(&name)?.to_string(), name)))
+        .collect()
 }
 
 /// One principal or group in full, by its SID.

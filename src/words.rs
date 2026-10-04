@@ -5,6 +5,8 @@ use jiff::tz::TimeZone;
 use libauthd::claim::{self, Claim, Values};
 use libauthd::credential::Policy;
 use libauthd::wire::{LogonType, LogonTypes};
+use libauthd_policy::tier_name;
+use peios::security::IntegrityLevel;
 
 use crate::directory;
 
@@ -49,6 +51,50 @@ pub fn policy_of(value: &str) -> Option<Policy> {
 pub fn policy_value(policy: Policy) -> &'static str {
     POLICIES.iter().find(|(known, _, _)| *known == policy).map_or("", |(_, sent, _)| *sent)
 }
+
+/// What each privilege lets its holder do, in a person's words, by its name.
+pub const PRIVILEGES: &[(&str, &str)] = &[
+    ("SeCreateTokenPrivilege", "Make a token for anyone, without signing in. authd's alone."),
+    ("SeAssignPrimaryTokenPrivilege", "Start a process as someone else. peinit's, to start services."),
+    ("SeLockMemoryPrivilege", "Keep memory from being swapped out."),
+    ("SeIncreaseQuotaPrivilege", "Lift a process's resource limits."),
+    ("SeTcbPrivilege", "Act as part of the trusted core of the system."),
+    ("SeSecurityPrivilege", "Read and change what any object audits."),
+    ("SeLoadDriverPrivilege", "Load and unload kernel modules."),
+    ("SeSystemtimePrivilege", "Set the system clock."),
+    ("SeProfileSingleProcessPrivilege", "Profile another process."),
+    ("SeIncreaseBasePriorityPrivilege", "Raise another process's priority, or pin it to processors."),
+    ("SeBackupPrivilege", "Read anything, whatever its permissions, when backing it up."),
+    ("SeRestorePrivilege", "Write anything, and give it any owner, when restoring it."),
+    ("SeShutdownPrivilege", "Shut down and restart this machine."),
+    ("SeDebugPrivilege", "Look into and change other processes, whatever their permissions."),
+    ("SeAuditPrivilege", "Write to the audit log."),
+    ("SeChangeNotifyPrivilege", "Pass through folders on the way to a file. No shell starts without it."),
+    ("SeRemoteShutdownPrivilege", "Shut down this machine from another."),
+    ("SeManageVolumePrivilege", "Mount, unmount and reshape filesystems. Near the trusted core in what it allows."),
+    ("SeImpersonatePrivilege", "Act as a client who connects to it."),
+    ("SeCreateSymbolicLinkPrivilege", "Make symbolic links."),
+];
+
+/// What a privilege lets its holder do, or nothing for one without words.
+pub fn privilege(name: &str) -> &'static str {
+    PRIVILEGES.iter().find(|(known, _)| *known == name).map_or("", |(_, said)| *said)
+}
+
+/// An integrity level in words: its tier's name, or its number between them.
+pub fn integrity(level: IntegrityLevel) -> String {
+    tier_name(level).map_or_else(|| format!("Level {}", level.0), str::to_string)
+}
+
+/// The kinds of sign-in what someone gets may be worked out for: a form's
+/// value for each, and in words.
+pub const SIGN_INS: &[(&str, LogonType, &str)] = &[
+    ("interactive", LogonType::Interactive, "At the machine"),
+    ("remote", LogonType::RemoteInteractive, "On a remote desktop"),
+    ("network", LogonType::Network, "Over the network"),
+    ("batch", LogonType::Batch, "To run scheduled jobs"),
+    ("service", LogonType::Service, "To run a service"),
+];
 
 /// The claim types, by the names libauthd gives them, in words, and how to
 /// type a value of each, in the order the claim form offers them.
@@ -147,6 +193,21 @@ mod tests {
         for code in [claim::TYPE_INT64, claim::TYPE_UINT64, claim::TYPE_BOOLEAN, claim::TYPE_STRING, claim::TYPE_SID, claim::TYPE_OCTET] {
             assert!(!claim_type(&Values::empty_of(code).unwrap()).is_empty());
         }
+    }
+
+    /// Every privilege a record may grant has words, and no words name one
+    /// that isn't.
+    #[test]
+    fn every_privilege_is_said_in_words() {
+        use peios::security::Privileges;
+        for (name, _) in Privileges::all_named() {
+            assert!(!privilege(name).is_empty(), "{name} has no words");
+        }
+        for (name, _) in PRIVILEGES {
+            assert!(Privileges::parse_name(name).is_some(), "{name} is not a privilege");
+        }
+        assert_eq!(integrity(IntegrityLevel::HIGH), "High");
+        assert_eq!(integrity(IntegrityLevel(8193)), "Level 8193");
     }
 
     #[test]

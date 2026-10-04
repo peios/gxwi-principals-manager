@@ -51,6 +51,14 @@ pub enum Doing {
     GroupDeleting,
     /// A user to put in the picked group.
     AddMember,
+    /// A new policy record.
+    NewRecord,
+    /// The picked policy record.
+    EditRecord,
+    /// Asking before the picked policy record is deleted.
+    RecordDeleting,
+    /// The privileges denied to everyone.
+    EditDenied,
 }
 
 /// The fields a password is typed in, cleared whenever a form is left.
@@ -120,9 +128,12 @@ pub fn short(qualified: &str) -> &str {
 pub fn clear(fields: &mut Fields) {
     for name in [
         "name", "full", "home", "shell", "no-password", "administrator", "new-name", "which", "credential", "primary", "description", "member", "group", "key",
-        "key-label", "claim-name", "claim-type", "claim-values",
+        "key-label", "claim-name", "claim-type", "claim-values", "principal", "integrity", "owner", "dacl",
     ] {
         fields.set(name, "");
+    }
+    for index in 0..peios::security::Privileges::all_named().count() {
+        fields.set(&format!("priv-{index}"), "");
     }
     forget(fields);
     for index in 0..words::LOGON_TYPES.len() {

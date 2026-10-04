@@ -69,7 +69,9 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent-soli
 }
 .users .head, .users .entries button { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 80px 80px; }
 .groups .head, .groups .entries button { grid-template-columns: minmax(0, 1.4fr) 80px 90px minmax(0, 2fr); }
-.entries .about { font-size: 12px; color: var(--text-muted); }
+.records .head, .records .entries button { grid-template-columns: minmax(0, 1.4fr) 100px 80px minmax(0, 1.2fr); }
+.entries .about, .entries .also { font-size: 12px; color: var(--text-muted); }
+.entries .privs, .entries .level { font-size: 12px; }
 .head {
     flex: none;
     border-bottom: 1px solid var(--border-default);
@@ -169,6 +171,25 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent-soli
 .details .keys .key { display: grid; gap: 2px; min-width: 0; }
 .details .keys code { font-size: 11px; color: var(--text-secondary); overflow-wrap: anywhere; }
 .details .keys .added { color: var(--text-muted); }
+/* Privileges: each with what it lets its holder do. */
+.details .privileges { margin: 0; padding: 0; list-style: none; font-size: 12px; }
+.details .privileges li { display: grid; gap: 1px; padding: var(--space-1) 0; }
+.details .privileges .what, .details label.privilege small { color: var(--text-muted); font-size: 12px; }
+.details .denied { color: var(--danger-text); font-size: 11px; }
+.details .unsaid { color: var(--text-muted); }
+.details .edit label.privilege { align-items: flex-start; }
+.details .edit label.privilege input { margin-top: 2px; }
+.details .edit label.privilege span { display: grid; gap: 1px; min-width: 0; overflow-wrap: anywhere; }
+.details label.inline { display: flex; align-items: center; gap: var(--space-2); font-size: 12px; color: var(--text-secondary); }
+.details label.inline select {
+    min-height: var(--control-sm);
+    padding: 2px var(--space-2);
+    font: inherit;
+    color: var(--text-primary);
+    background: var(--bg-sunken);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+}
 .details .edit textarea {
     box-sizing: border-box;
     width: 100%;
@@ -250,10 +271,14 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent-soli
     .users .head span:nth-child(2), .users .entries .full, .users .head span:nth-child(3), .users .entries .kind { display: none; }
     .groups .head, .groups .entries button { grid-template-columns: minmax(0, 2fr) 80px minmax(0, 1fr); }
     .groups .head span:nth-child(4), .groups .entries .about { display: none; }
+    .records .head, .records .entries button { grid-template-columns: minmax(0, 1fr) 90px 70px; }
+    .records .head span:nth-child(4), .records .entries .also { display: none; }
     .details { width: 260px; }
 }
 @media (max-width: 560px) {
     .details { width: 50%; }
     .groups .head, .groups .entries button { grid-template-columns: minmax(0, 1fr) 70px; }
     .groups .head span:nth-child(2), .groups .entries .kind { display: none; }
+    .records .head, .records .entries button { grid-template-columns: minmax(0, 1fr) 70px; }
+    .records .head span:nth-child(2), .records .entries .privs { display: none; }
 }

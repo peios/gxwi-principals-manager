@@ -16,5 +16,8 @@ peios = { git = "https://github.com/peios/peios-rs.git", rev = "3cf23f68d40c4adf
 # this checkout until they are pushed.
 libauthd = { path = "../authd/libauthd" }
 libauthd-client = { path = "../authd/libauthd-client" }
+# What this machine grants a principal, read and worked out by the code authd
+# mints from, and written back to the registry.
+libauthd-policy = { path = "../authd/libauthd-policy", features = ["write"] }
 # The day a key was added, on this machine's clock.
 jiff = "0.2.29"

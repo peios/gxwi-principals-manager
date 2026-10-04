@@ -14,12 +14,16 @@ use libauthd_client::admin::Admin;
 use libauthd_client::ident::Ident;
 use libgxwi::{Facts, Fields as Typed, Live, Surface, Value as Pressed, escape};
 
-use libauthd::credential::Policy;
+use libauthd::credential::Policy as CredentialPolicy;
 use libauthd::lps::KeyInfo;
+use libauthd_policy::Policy;
+use libauthd_policy::write::Draft;
+use peios::security::{Sid, SidRef};
 
 use crate::accounts::{self, Account, Doing};
 use crate::directory::{self, Directory, Members};
 use crate::groups::{self, Team};
+use crate::policy::{self, Saved};
 use crate::{claims, keys, words};
 
 pub struct Manager {
@@ -42,16 +46,35 @@ pub struct Manager {
     doing: Doing,
     /// What came of the last change: what was done, or why it wasn't.
     said: Option<Result<String, String>>,
+    /// What this machine grants each principal, and whether this person may
+    /// change it, which the policy key's own descriptor says.
+    policy: Policy,
+    may_policy: Result<(), String>,
+    /// The policy record picked, by its SID, or [`policy::DENIED`].
+    record: Option<String>,
+    /// Why saving the record form is worth asking about first, while it is
+    /// being asked.
+    asked: Option<String>,
+}
+
+/// What the window reads again in the background, for the one picked then.
+pub struct Heard {
+    pub directory: Directory,
+    pub picked: Option<String>,
+    pub details: Option<Result<Record, String>>,
+    pub credentials: Option<Credentials>,
+    pub policy: Policy,
 }
 
 /// A user's credential policy and SSH keys, or why they couldn't be read.
-pub type Credentials = Result<(Policy, Vec<KeyInfo>), String>;
+pub type Credentials = Result<(CredentialPolicy, Vec<KeyInfo>), String>;
 
 /// Which list is shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Users,
     Groups,
+    Privileges,
 }
 
 /// What changing the local principals needs, said where the person lacks it.
@@ -72,6 +95,10 @@ impl Manager {
             authority: Ok(()),
             doing: Doing::Looking,
             said: None,
+            policy: Policy::floor(),
+            may_policy: Ok(()),
+            record: None,
+            asked: None,
         };
         manager.refresh();
         manager
@@ -100,6 +127,8 @@ impl Manager {
     fn refresh(&mut self) {
         self.directory = directory::read(&self.ident);
         self.authority = self.ask_authority();
+        self.policy = Policy::read();
+        self.may_policy = libauthd_policy::write::may_write();
         self.reread();
     }
 
@@ -134,18 +163,21 @@ impl Manager {
 
     /// Whether what has been read again in the background, for the one
     /// picked then, differs from what is shown.
-    pub fn differs(&self, directory: &Directory, picked: Option<&str>, details: Option<&Result<Record, String>>, credentials: Option<&Credentials>) -> bool {
-        *directory != self.directory
-            || (picked == self.picked.as_deref()
-                && (details.is_some_and(|details| Some(details) != self.details.as_ref()) || credentials != self.credentials.as_ref()))
+    pub fn differs(&self, heard: &Heard) -> bool {
+        heard.directory != self.directory
+            || heard.policy != self.policy
+            || (heard.picked.as_deref() == self.picked.as_deref()
+                && (heard.details.as_ref().is_some_and(|details| Some(details) != self.details.as_ref()) || heard.credentials.as_ref() != self.credentials.as_ref()))
     }
 
     /// What has been read again in the background, shown, where the one it
     /// was read for is still the one picked. A group's long member list is
     /// read again with it.
-    pub fn heard(&mut self, directory: Directory, picked: Option<&str>, details: Option<Result<Record, String>>, credentials: Option<Credentials>) {
+    pub fn heard(&mut self, heard: Heard) {
+        let Heard { directory, picked, details, credentials, policy } = heard;
         self.directory = directory;
-        if details.is_some() && picked == self.picked.as_deref() {
+        self.policy = policy;
+        if details.is_some() && picked.as_deref() == self.picked.as_deref() {
             self.details = details;
             self.credentials = credentials;
             if self.members.is_some()
@@ -190,6 +222,7 @@ impl Manager {
     fn leave(&mut self, fields: &mut Typed) {
         self.doing = Doing::Looking;
         self.said = None;
+        self.asked = None;
         accounts::forget(fields);
     }
 
@@ -343,6 +376,89 @@ impl Manager {
         }
     }
 
+    /// Does what the person asked in Privileges, or of a principal's record
+    /// from its details. Answers whether it was a policy event at all.
+    fn act_on_policy(&mut self, name: &str, value: &Pressed, fields: &mut Typed) -> bool {
+        let editing = matches!(self.doing, Doing::NewRecord | Doing::EditRecord | Doing::EditDenied);
+        match name {
+            "pick-record" => {
+                if let Some(record) = value["record"].as_str().filter(|record| !record.is_empty()) {
+                    self.leave(fields);
+                    self.view = View::Privileges;
+                    self.record = Some(record.to_string());
+                }
+            }
+            "new-record" | "own-record" if self.may_policy.is_ok() => {
+                let sid = value["sid"].as_str().and_then(|sid| sid.parse::<Sid>().ok());
+                self.leave(fields);
+                self.view = View::Privileges;
+                accounts::clear(fields);
+                match sid.as_ref().and_then(|sid| self.policy.record(sid.as_ref())) {
+                    Some(record) => {
+                        self.record = Some(record.sid.to_string());
+                        self.doing = Doing::EditRecord;
+                        policy::fill(&Draft::of(record), "", fields);
+                    }
+                    None => {
+                        self.doing = Doing::NewRecord;
+                        let principal = sid.map(|sid| policy::called(sid.as_ref(), &self.directory)).unwrap_or_default();
+                        policy::fill(&Draft::default(), &principal, fields);
+                    }
+                }
+            }
+            "edit-record" | "delete-record" | "delete-record-yes" | "edit-denied" if self.may_policy.is_ok() => {
+                let picked = self.record.clone().unwrap_or_default();
+                let record = picked.parse::<Sid>().ok().and_then(|sid| self.policy.record(sid.as_ref()).cloned());
+                self.said = None;
+                match (name, record) {
+                    ("edit-denied", _) => {
+                        self.doing = Doing::EditDenied;
+                        accounts::clear(fields);
+                        policy::fill_denied(&self.policy, fields);
+                    }
+                    ("edit-record", Some(record)) => {
+                        self.doing = Doing::EditRecord;
+                        accounts::clear(fields);
+                        policy::fill(&Draft::of(&record), "", fields);
+                    }
+                    ("delete-record", Some(_)) => self.doing = Doing::RecordDeleting,
+                    ("delete-record-yes", Some(record)) => {
+                        let called = policy::called(record.sid.as_ref(), &self.directory);
+                        let outcome = libauthd_policy::write::delete(&record.name)
+                            .map(|()| format!("The record for {called} is deleted. What it granted is no longer granted from their next sign-in."));
+                        if outcome.is_ok() {
+                            self.record = None;
+                        }
+                        self.doing = Doing::Looking;
+                        self.changed(outcome);
+                    }
+                    _ => {}
+                }
+            }
+            "save" | "save-anyway" if editing => {
+                let outcome = match self.doing {
+                    Doing::EditDenied => policy::save_denied(fields).map(|said| Saved::Done(policy::DENIED.to_string(), said)),
+                    _ => policy::save(&self.doing, &self.policy, &self.directory, self.record.as_deref(), fields, name == "save-anyway"),
+                };
+                match outcome {
+                    Ok(Saved::Done(record, said)) => {
+                        self.asked = None;
+                        self.record = Some(record);
+                        self.changed(Ok(said));
+                    }
+                    Ok(Saved::Ask(why)) => self.asked = Some(why),
+                    Err(why) => {
+                        self.asked = None;
+                        self.said = Some(Err(why));
+                    }
+                }
+            }
+            "unask" => self.asked = None,
+            _ => return false,
+        }
+        true
+    }
+
     /// Does what the person asked: of the user or group picked, or a new one.
     fn act(&mut self, name: &str, value: &Pressed, fields: &mut Typed) {
         if name == "new" || name == "new-group" {
@@ -353,6 +469,9 @@ impl Manager {
         }
         if name == "save" && matches!(self.doing, Doing::New | Doing::NewGroup) {
             self.make(fields);
+            return;
+        }
+        if self.act_on_policy(name, value, fields) {
             return;
         }
         if self.team().is_some() {
@@ -466,10 +585,18 @@ impl Manager {
     }
 
     fn listing(&self, filter: &str) -> String {
+        if self.view == View::Privileges {
+            return format!(
+                "{}{}",
+                policy::notes(&self.policy),
+                policy::listing(&self.policy, &self.directory, self.record.as_deref(), |texts| Self::matches(filter, texts)),
+            );
+        }
         if let Some(why) = &self.directory.trouble {
             return format!("<p class=\"trouble\">{}</p>", escape(why));
         }
         let rows: String = match self.view {
+            View::Privileges => String::new(),
             View::Users => self
                 .directory
                 .users
@@ -522,7 +649,7 @@ impl Manager {
             let none = match (self.view, filter.trim().is_empty()) {
                 (_, false) => "Nothing matches.",
                 (View::Users, true) => "There are no users.",
-                (View::Groups, true) => "There are no groups.",
+                (View::Groups | View::Privileges, true) => "There are no groups.",
             };
             return format!("<p class=\"more\">{none}</p>");
         }
@@ -536,7 +663,94 @@ impl Manager {
         format!("<button type=\"button\" class=\"link\" fx-click=\"show\" fx-value-sid=\"{}\">{}</button>", escape(&sid), escape(&shown))
     }
 
+    /// The pane in Privileges: a record or what is denied to everyone, or
+    /// the form changing one.
+    fn policy_details(&self) -> String {
+        let mut said = self.said();
+        if let Some(why) = &self.asked {
+            said += &format!(
+                "<div class=\"asking\" role=\"alertdialog\" aria-label=\"Save anyway?\"><p>{}</p>\
+                 <button type=\"button\" class=\"danger\" fx-click=\"save-anyway\">Save anyway</button>\
+                 <button type=\"button\" fx-click=\"unask\" fx-autofocus>Go back</button></div>",
+                escape(why),
+            );
+        }
+        if matches!(self.doing, Doing::NewRecord | Doing::EditRecord | Doing::EditDenied) && self.may_policy.is_ok() {
+            let form = policy::render(&self.doing, &self.policy, &self.directory, self.record.as_deref(), &said);
+            if !form.is_empty() {
+                return form;
+            }
+        }
+        match &self.record {
+            Some(picked) => policy::details(&self.policy, &self.directory, picked, &self.may_policy, &said, &self.doing),
+            None => format!(
+                "<aside class=\"details\" aria-label=\"Details\">{said}<p class=\"more\">Pick a record to see what it grants. \
+                 Each user or group's own page says what they get in all.</p></aside>"
+            ),
+        }
+    }
+
+    /// The SIDs a principal's token carries before authd adds its own: them,
+    /// their groups and their primary group.
+    fn carried(record: &Record) -> Vec<Sid> {
+        let mut sids: Vec<Sid> = Vec::new();
+        if let Some(Value::Groups(groups)) = record.value(Fields::GROUPS) {
+            sids.extend(groups.iter().filter_map(|group| SidRef::from_bytes(&group.sid).map(SidRef::to_sid)));
+        }
+        if let Some(Value::PrimaryGroup(group)) = record.value(Fields::PRIMARY_GROUP)
+            && let Some(sid) = SidRef::from_bytes(&group.sid)
+        {
+            sids.push(sid.to_sid());
+        }
+        sids
+    }
+
+    /// What policy grants the principal or group shown: what a local user
+    /// gets in all, or what a group's own record grants its members.
+    fn privileges_section(&self, record: &Record, fields: &Typed) -> String {
+        let Some(sid) = SidRef::from_bytes(&record.sid) else { return String::new() };
+        let own = self.policy.record(sid);
+        let may = self.may_policy.is_ok();
+        let button = |label: &str| {
+            if may {
+                format!("<p class=\"actions\"><button type=\"button\" fx-click=\"own-record\" fx-value-sid=\"{}\">{label}</button></p>", escape(&sid.to_string()))
+            } else {
+                String::new()
+            }
+        };
+        match record.kind_found {
+            libauthd::ident::Kind::Principal if directory::local(&sid.to_string()) => {
+                let effective = policy::effective(&self.policy, &self.directory, sid, &Self::carried(record), fields.get("as"));
+                format!("{effective}{}", button(if own.is_some() { "Edit their own record" } else { "Give them their own record" }))
+            }
+            libauthd::ident::Kind::Group => {
+                let said = match own {
+                    None => "<p class=\"more\">No record: being in it grants nothing here on its own.</p>".to_string(),
+                    Some(own) => {
+                        let mut parts = Vec::new();
+                        if let Some(privileges) = own.privileges {
+                            parts.push(words::count(privileges.canonical_names().count(), "privilege"));
+                        }
+                        if let Some(level) = own.integrity {
+                            parts.push(format!("integrity {}", words::integrity(level)));
+                        }
+                        format!(
+                            "<p class=\"more\">Its record grants its members {}. <button type=\"button\" class=\"link\" fx-click=\"pick-record\" fx-value-record=\"{}\">See the record</button></p>",
+                            escape(&if parts.is_empty() { "nothing".to_string() } else { parts.join(", ") }),
+                            escape(&sid.to_string()),
+                        )
+                    }
+                };
+                format!("<h3>Privileges</h3>{said}{}", button(if own.is_some() { "Edit its record" } else { "Give it a record" }))
+            }
+            _ => String::new(),
+        }
+    }
+
     fn details(&self, fields: &Typed) -> String {
+        if self.view == View::Privileges {
+            return self.policy_details();
+        }
         if !matches!(self.doing, Doing::Looking | Doing::Deleting | Doing::GroupDeleting) {
             let choices = self.choices();
             let mut form = accounts::render(&self.doing, self.account().as_ref(), fields, &self.said(), &choices);
@@ -553,7 +767,7 @@ impl Manager {
             }
             let what = match self.view {
                 View::Users => "Pick a user to see them in full.",
-                View::Groups => "Pick a group to see who is in it.",
+                View::Groups | View::Privileges => "Pick a group to see who is in it.",
             };
             return format!("<aside class=\"details\" aria-label=\"Details\"><p class=\"more\">{what}</p></aside>");
         };
@@ -680,6 +894,7 @@ impl Manager {
                 _ => String::new(),
             };
         }
+        sections += &self.privileges_section(record, fields);
         let claims = match record.value(Fields::CLAIMS) {
             Some(Value::Claims(claims)) => Some(claims.as_slice()),
             _ => None,
@@ -815,20 +1030,33 @@ impl Live for Manager {
         let head = match self.view {
             View::Users => "<div class=\"head\"><span>Name</span><span>Full name</span><span>Kind</span><span>State</span></div>",
             View::Groups => "<div class=\"head\"><span>Name</span><span>Kind</span><span>Members</span><span>Description</span></div>",
+            View::Privileges => "<div class=\"head\"><span>Principal</span><span>Privileges</span><span>Integrity</span><span>Also</span></div>",
         };
-        let new = match (&self.authority, self.view) {
-            (Ok(()), View::Users) => "<button type=\"button\" fx-click=\"new\" fx-key=\"Ctrl+N\" title=\"A new user (Ctrl+N)\">New user</button>",
-            (Ok(()), View::Groups) => "<button type=\"button\" fx-click=\"new-group\" fx-key=\"Ctrl+N\" title=\"A new group (Ctrl+N)\">New group</button>",
-            (Err(_), _) => "",
+        let new = match (&self.authority, &self.may_policy, self.view) {
+            (Ok(()), _, View::Users) => "<button type=\"button\" fx-click=\"new\" fx-key=\"Ctrl+N\" title=\"A new user (Ctrl+N)\">New user</button>",
+            (Ok(()), _, View::Groups) => "<button type=\"button\" fx-click=\"new-group\" fx-key=\"Ctrl+N\" title=\"A new group (Ctrl+N)\">New group</button>",
+            (_, Ok(()), View::Privileges) => "<button type=\"button\" fx-click=\"new-record\" fx-key=\"Ctrl+N\" title=\"A new record (Ctrl+N)\">New record</button>",
+            _ => "",
+        };
+        // In Privileges, the key's descriptor says who may change it.
+        let authority = match (self.view, &self.may_policy) {
+            (View::Privileges, Ok(())) => String::new(),
+            (View::Privileges, Err(why)) => format!("<p class=\"said\" role=\"status\">You may look, but not change anything. {}</p>", escape(why)),
+            _ => authority,
         };
         format!(
-            "<div class=\"bar\"><div class=\"tabs\" role=\"group\" aria-label=\"Show\">{users}{groups}</div>\
+            "<div class=\"bar\"><div class=\"tabs\" role=\"group\" aria-label=\"Show\">{users}{groups}{privileges}</div>\
              <input name=\"filter\" autocomplete=\"off\" spellcheck=\"false\" placeholder=\"Find by name or SID\" aria-label=\"Find\">\
              {new}<button type=\"button\" fx-click=\"refresh\" fx-key=\"F5\" title=\"Read again (F5)\">Refresh</button></div>{authority}\
              <div class=\"body\"><div class=\"list {class}\">{head}{listing}</div>{details}</div>{footer}",
             users = tab(View::Users, "Users", "users"),
             groups = tab(View::Groups, "Groups", "groups"),
-            class = if self.view == View::Users { "users" } else { "groups" },
+            privileges = tab(View::Privileges, "Privileges", "privileges"),
+            class = match self.view {
+                View::Users => "users",
+                View::Groups => "groups",
+                View::Privileges => "records",
+            },
             listing = self.listing(filter),
             details = self.details(facts.fields),
             footer = self.footer(),
@@ -838,9 +1066,13 @@ impl Live for Manager {
     fn event(&mut self, name: &str, value: &Pressed, fields: &mut Typed) {
         let sid = value["sid"].as_str().filter(|sid| !sid.is_empty());
         match name {
-            "users" | "groups" => {
+            "users" | "groups" | "privileges" => {
                 self.leave(fields);
-                self.view = if name == "users" { View::Users } else { View::Groups };
+                self.view = match name {
+                    "users" => View::Users,
+                    "groups" => View::Groups,
+                    _ => View::Privileges,
+                };
             }
             "refresh" => self.refresh(),
             "pick" | "show" => {
@@ -877,6 +1109,10 @@ mod tests {
             authority: Ok(()),
             doing: Doing::Looking,
             said: None,
+            policy: Policy::floor(),
+            may_policy: Ok(()),
+            record: None,
+            asked: None,
         }
     }
 
@@ -898,6 +1134,7 @@ mod tests {
             ],
             incomplete: Vec::new(),
             trouble: None,
+            services: Vec::new(),
         }
     }
 
@@ -1048,7 +1285,7 @@ mod tests {
             withheld: vec![],
         }));
         manager.credentials = Some(Ok((
-            Policy::PasswordOrKey,
+            CredentialPolicy::PasswordOrKey,
             vec![KeyInfo { id: [0xab; 16], fingerprint: "SHA256:abc".into(), label: "laptop".into(), created: 1_791_072_000 }],
         )));
         let shown = manager.details(&Typed::default());
@@ -1058,12 +1295,38 @@ mod tests {
         for event in ["add-key", "add-claim", "edit-claim", "remove-claim"] {
             assert!(shown.contains(&format!("fx-click=\"{event}\"")), "{event}: {shown}");
         }
-        assert_eq!(manager.account().unwrap().policy, Some(Policy::PasswordOrKey));
+        assert_eq!(manager.account().unwrap().policy, Some(CredentialPolicy::PasswordOrKey));
 
         // Someone who may only look sees the claims, and nothing lpsd keeps.
         manager.authority = Err(format!("You may look, but not change anything. {NEEDS}"));
         let shown = manager.details(&Typed::default());
         assert!(shown.contains("Engineering") && !shown.contains("Signs in with") && !shown.contains("add-claim"), "{shown}");
+    }
+
+    #[test]
+    fn a_group_says_what_its_record_grants_and_offers_one_only_to_who_may_write_it() {
+        let mut manager = seen(directory());
+        manager.policy = libauthd_policy::Policy {
+            configured: true,
+            records: vec![libauthd_policy::Record {
+                privileges: Some(peios::security::Privileges::BACKUP),
+                ..libauthd_policy::Record::empty("Administrators", "S-1-5-32-544".parse().unwrap())
+            }],
+            denied: peios::security::Privileges::empty(),
+            problems: Vec::new(),
+        };
+        manager.details = Some(Ok(group("S-1-5-32-544", "Administrators", vec![])));
+        let shown = manager.details(&Typed::default());
+        assert!(shown.contains("Its record grants its members 1 privilege.") && shown.contains("Edit its record"), "{shown}");
+        manager.details = Some(Ok(group("S-1-5-21-1-2-3-1100", "developers", vec![])));
+        assert!(manager.details(&Typed::default()).contains("No record: being in it grants nothing here on its own."));
+        manager.may_policy = Err("You may not change this machine's policy.".into());
+        assert!(!manager.details(&Typed::default()).contains("own-record"));
+
+        manager.view = View::Privileges;
+        manager.record = Some("S-1-5-32-544".into());
+        let record = manager.details(&Typed::default());
+        assert!(record.contains("<code>SeBackupPrivilege</code>") && !record.contains("edit-record"), "{record}");
     }
 
     #[test]

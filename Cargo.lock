@@ -319,6 +319,7 @@ dependencies = [
  "jiff",
  "libauthd",
  "libauthd-client",
+ "libauthd-policy",
  "libgxwi",
  "peios",
 ]
@@ -521,6 +522,15 @@ name = "libauthd-client"
 version = "0.0.22"
 dependencies = [
  "libauthd",
+]
+
+[[package]]
+name = "libauthd-policy"
+version = "0.0.22"
+dependencies = [
+ "libauthd",
+ "peios",
+ "sha1",
 ]
 
 [[package]]
