@@ -174,6 +174,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent-soli
 /* Privileges: each with what it lets its holder do. */
 .details .privileges { margin: 0; padding: 0; list-style: none; font-size: 12px; }
 .details .privileges li { display: grid; gap: 1px; padding: var(--space-1) 0; }
+.details dl + .privileges { margin-top: var(--space-3); }
 .details .privileges .what, .details label.privilege small { color: var(--text-muted); font-size: 12px; }
 .details .denied { color: var(--danger-text); font-size: 11px; }
 .details .unsaid { color: var(--text-muted); }
