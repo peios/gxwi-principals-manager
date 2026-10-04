@@ -158,6 +158,28 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent-soli
 .details .claims li:last-child { border-bottom: 0; }
 .details .claims .type { color: var(--text-muted); }
 .details .claims .values { overflow-wrap: anywhere; }
+.details .claims .top { display: flex; align-items: center; gap: var(--space-2); }
+/* Edit and Remove together, at the end of the line. */
+.details .tools { display: flex; gap: var(--space-1); margin-left: auto; }
+.details .tools button.small { margin-left: 0; }
+/* A heading with Add beside it. */
+.details .section { display: flex; align-items: center; gap: var(--space-2); margin: var(--space-4) 0 var(--space-2); }
+.details .section h3 { margin: 0; }
+.details button.small.go:hover { color: var(--text-primary); border-color: var(--border-strong); }
+.details .keys .key { display: grid; gap: 2px; min-width: 0; }
+.details .keys code { font-size: 11px; color: var(--text-secondary); overflow-wrap: anywhere; }
+.details .keys .added { color: var(--text-muted); }
+.details .edit textarea {
+    box-sizing: border-box;
+    width: 100%;
+    padding: 3px var(--space-2);
+    font: 500 12px/1.4 var(--font-mono);
+    color: var(--text-primary);
+    background: var(--bg-sunken);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    resize: vertical;
+}
 
 .details button.primary { color: var(--accent-on); background: var(--accent-solid); border-color: var(--accent-solid); }
 .details button.danger { color: var(--danger-text); border-color: var(--danger-text); }

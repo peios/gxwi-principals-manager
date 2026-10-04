@@ -14,10 +14,13 @@ use libauthd_client::admin::Admin;
 use libauthd_client::ident::Ident;
 use libgxwi::{Facts, Fields as Typed, Live, Surface, Value as Pressed, escape};
 
+use libauthd::credential::Policy;
+use libauthd::lps::KeyInfo;
+
 use crate::accounts::{self, Account, Doing};
 use crate::directory::{self, Directory, Members};
 use crate::groups::{self, Team};
-use crate::words;
+use crate::{claims, keys, words};
 
 pub struct Manager {
     pub window: Weak<Surface<Manager>>,
@@ -30,6 +33,9 @@ pub struct Manager {
     details: Option<Result<Record, String>>,
     /// The members of the group picked, where more than its record holds.
     members: Option<Result<Vec<Record>, String>>,
+    /// What the local user picked signs in with, and their SSH keys, where
+    /// this person may administer the store: lpsd tells nobody else.
+    credentials: Option<Credentials>,
     /// Whether this person may change the store, and why not.
     authority: Result<(), String>,
     /// What is being done in the details pane.
@@ -37,6 +43,9 @@ pub struct Manager {
     /// What came of the last change: what was done, or why it wasn't.
     said: Option<Result<String, String>>,
 }
+
+/// A user's credential policy and SSH keys, or why they couldn't be read.
+pub type Credentials = Result<(Policy, Vec<KeyInfo>), String>;
 
 /// Which list is shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +68,7 @@ impl Manager {
             picked: None,
             details: None,
             members: None,
+            credentials: None,
             authority: Ok(()),
             doing: Doing::Looking,
             said: None,
@@ -71,8 +81,18 @@ impl Manager {
         &self.ident
     }
 
+    pub fn admin(&self) -> &Admin {
+        &self.admin
+    }
+
     pub fn picked(&self) -> Option<&str> {
         self.picked.as_deref()
+    }
+
+    /// The name of the user picked, if they are a local one whose
+    /// credentials this person may read.
+    pub fn local_user(&self) -> Option<String> {
+        self.account().map(|account| account.name)
     }
 
     /// Reads everything again, and asks again whether this person may
@@ -109,20 +129,25 @@ impl Manager {
                 self.members = None;
             }
         }
+        self.credentials = self.local_user().map(|name| self.admin.keys(&name).map_err(|refusal| refusal.reason));
     }
 
-    /// Whether what has been read again in the background differs from what
-    /// is shown.
-    pub fn differs(&self, directory: &Directory, details: Option<&Result<Record, String>>) -> bool {
-        *directory != self.directory || details.is_some_and(|details| Some(details) != self.details.as_ref())
+    /// Whether what has been read again in the background, for the one
+    /// picked then, differs from what is shown.
+    pub fn differs(&self, directory: &Directory, picked: Option<&str>, details: Option<&Result<Record, String>>, credentials: Option<&Credentials>) -> bool {
+        *directory != self.directory
+            || (picked == self.picked.as_deref()
+                && (details.is_some_and(|details| Some(details) != self.details.as_ref()) || credentials != self.credentials.as_ref()))
     }
 
-    /// What has been read again in the background, shown. A group's long
-    /// member list is read again with it.
-    pub fn heard(&mut self, directory: Directory, details: Option<Result<Record, String>>) {
+    /// What has been read again in the background, shown, where the one it
+    /// was read for is still the one picked. A group's long member list is
+    /// read again with it.
+    pub fn heard(&mut self, directory: Directory, picked: Option<&str>, details: Option<Result<Record, String>>, credentials: Option<Credentials>) {
         self.directory = directory;
-        if details.is_some() {
+        if details.is_some() && picked == self.picked.as_deref() {
             self.details = details;
+            self.credentials = credentials;
             if self.members.is_some()
                 && let Some(sid) = self.picked.clone()
             {
@@ -150,7 +175,14 @@ impl Manager {
     fn account(&self) -> Option<Account> {
         let Some(Ok(record)) = &self.details else { return None };
         let changeable = self.authority.is_ok() && record.kind_found == libauthd::ident::Kind::Principal && directory::local(&directory::sid_text(&record.sid));
-        changeable.then(|| Account::of(record))
+        changeable.then(|| {
+            let mut account = Account::of(record);
+            if let Some(Ok((policy, keys))) = &self.credentials {
+                account.policy = Some(*policy);
+                account.keys = keys.clone();
+            }
+            account
+        })
     }
 
     /// Stops whatever was being done in the pane, forgetting any password
@@ -346,10 +378,46 @@ impl Manager {
                     "edit" => Doing::Profile,
                     "rename" => Doing::Rename,
                     "sign-in" => Doing::SignIn,
-                    _ => Doing::Password(admin.show(&account.name).ok().and_then(|detail| detail.credential_policy)),
+                    _ => Doing::Password(account.policy),
                 };
                 self.said = None;
                 accounts::fill(&self.doing, &account, fields);
+            }
+            "add-key" => {
+                self.doing = Doing::AddKey;
+                self.said = None;
+                accounts::clear(fields);
+            }
+            "remove-key" => {
+                let Some(id) = value["key"].as_str().and_then(keys::id_of) else { return };
+                let label = account.keys.iter().find(|key| key.id == id).map(|key| key.label.clone()).unwrap_or_default();
+                let outcome = admin.key_remove(&account.name, id).map(|()| {
+                    if label.is_empty() { "The key is removed.".to_string() } else { format!("The key {label} is removed.") }
+                });
+                self.changed(outcome.map_err(|refusal| refusal.reason));
+            }
+            "add-claim" | "edit-claim" => {
+                let editing = value["claim"].as_str().and_then(|name| account.claims.iter().find(|claim| claim.name == name));
+                accounts::clear(fields);
+                self.said = None;
+                match (name, editing) {
+                    ("add-claim", _) => {
+                        self.doing = Doing::NewClaim;
+                        claims::fill(None, fields);
+                    }
+                    (_, Some(claim)) => {
+                        self.doing = Doing::EditClaim(claim.name.clone());
+                        claims::fill(Some(claim), fields);
+                    }
+                    _ => {}
+                }
+            }
+            "remove-claim" => {
+                let Some(claim) = value["claim"].as_str().filter(|claim| !claim.is_empty()) else { return };
+                let outcome = admin
+                    .remove_claim(&account.name, claim)
+                    .map(|()| format!("{}'s claim {claim} is removed. It applies from their next sign-in.", account.name));
+                self.changed(outcome.map_err(|refusal| refusal.reason));
             }
             "enable" | "disable" | "disable-instead" => {
                 let enabled = name == "enable";
@@ -377,6 +445,12 @@ impl Manager {
                     Doing::Password(policy) => accounts::save_password(admin, &account, *policy, fields),
                     Doing::SignIn => accounts::save_sign_in(admin, &account, fields),
                     Doing::Join => accounts::save_join(admin, &account, fields),
+                    Doing::AddKey => keys::save(admin, &account, fields),
+                    Doing::NewClaim => claims::save(admin, &account, None, fields, &self.directory),
+                    Doing::EditClaim(name) => {
+                        let Some(claim) = account.claims.iter().find(|claim| claim.name == *name) else { return };
+                        claims::save(admin, &account, Some(claim), fields, &self.directory)
+                    }
                     _ => return,
                 };
                 accounts::forget(fields);
@@ -525,6 +599,41 @@ impl Manager {
             let default = if *types == LogonTypes::UNSTATED { "<p class=\"note\">Nothing is stated, so the machine's default applies.</p>" } else { "" };
             sections += &format!("<h3>May sign in</h3><ul class=\"plain\">{said}</ul>{default}");
         }
+        // A section's heading, with a button adding to it where there is one.
+        let head = |title: &str, add: Option<(&str, &str)>| match add {
+            Some((event, what)) => format!(
+                "<div class=\"section\"><h3>{title}</h3><button type=\"button\" class=\"small go\" fx-click=\"{event}\" title=\"{}\">Add</button></div>",
+                escape(what)
+            ),
+            None => format!("<h3>{title}</h3>"),
+        };
+        if account.is_some() {
+            sections += &match &self.credentials {
+                Some(Ok((policy, keys))) => {
+                    let zone = jiff::tz::TimeZone::system();
+                    let listed: String = keys
+                        .iter()
+                        .map(|key| {
+                            format!(
+                                "<li><span class=\"key\"><span>{label}</span><code>{fingerprint}</code><span class=\"added\">Added {added}</span></span>{remove}</li>",
+                                label = escape(if key.label.is_empty() { "No label" } else { &key.label }),
+                                fingerprint = escape(&key.fingerprint),
+                                added = escape(&words::day(key.created, &zone)),
+                                remove = remove("remove-key", &format!(" fx-value-key=\"{}\"", keys::id_text(&key.id)), &format!("Remove the key {}", key.label)),
+                            )
+                        })
+                        .collect();
+                    format!(
+                        "<h3>Signs in with</h3><ul class=\"plain\"><li>{}</li></ul>{}{}",
+                        escape(words::policy(*policy)),
+                        head("SSH keys", Some(("add-key", "Add an SSH key"))),
+                        if keys.is_empty() { "<p class=\"more\">No SSH keys.</p>".to_string() } else { format!("<ul class=\"plain keys\">{listed}</ul>") },
+                    )
+                }
+                Some(Err(why)) => format!("<h3>Signs in with</h3><p class=\"note bad\">{}</p>", escape(why)),
+                None => String::new(),
+            };
+        }
         if let Some(Value::Groups(groups)) = record.value(Fields::GROUPS) {
             let listed: String = groups
                 .iter()
@@ -571,8 +680,13 @@ impl Manager {
                 _ => String::new(),
             };
         }
-        if let Some(Value::Claims(claims)) = record.value(Fields::CLAIMS) {
-            sections += "<h3>Claims</h3>";
+        let claims = match record.value(Fields::CLAIMS) {
+            Some(Value::Claims(claims)) => Some(claims.as_slice()),
+            _ => None,
+        };
+        if claims.is_some() || account.is_some() {
+            let claims = claims.unwrap_or_default();
+            sections += &head("Claims", account.as_ref().map(|_| ("add-claim", "Add a claim")));
             sections += &if claims.is_empty() {
                 "<p class=\"more\">No claims.</p>".to_string()
             } else {
@@ -580,8 +694,18 @@ impl Manager {
                     .iter()
                     .map(|claim| {
                         let flags = words::claim_flags(claim);
+                        let tools = if account.is_some() {
+                            let named = format!(" fx-value-claim=\"{}\"", escape(&claim.name));
+                            format!(
+                                "<span class=\"tools\"><button type=\"button\" class=\"small go\" fx-click=\"edit-claim\"{named} title=\"Change {name}\">Edit</button>{}</span>",
+                                remove("remove-claim", &named, &format!("Remove {}", claim.name)),
+                                name = escape(&claim.name),
+                            )
+                        } else {
+                            String::new()
+                        };
                         format!(
-                            "<li><code>{name}</code><span class=\"type\">{kind}{flags}</span><span class=\"values\">{values}</span></li>",
+                            "<li><span class=\"top\"><code>{name}</code>{tools}</span><span class=\"type\">{kind}{flags}</span><span class=\"values\">{values}</span></li>",
                             name = escape(&claim.name),
                             kind = escape(words::claim_type(&claim.values)),
                             flags = if flags.is_empty() { String::new() } else { escape(&format!(" · {}", flags.join(", "))) },
@@ -749,6 +873,7 @@ mod tests {
             picked: None,
             details: None,
             members: None,
+            credentials: None,
             authority: Ok(()),
             doing: Doing::Looking,
             said: None,
@@ -908,6 +1033,37 @@ mod tests {
         manager.doing = Doing::Profile;
         let primaries: Vec<String> = manager.choices().into_iter().map(|(_, name)| name).collect();
         assert_eq!(primaries, ["Administrators", "developers"], "never a rule group such as Everyone");
+    }
+
+    #[test]
+    fn an_administrator_sees_what_a_user_signs_in_with_their_keys_and_claims_to_change() {
+        let mut manager = seen(directory());
+        manager.picked = Some("S-1-5-21-1-2-3-1002".into());
+        let claim = libauthd::claim::Claim { name: "Department".into(), flags: 0, values: libauthd::claim::Values::String(vec!["Engineering".into()]) };
+        manager.details = Some(Ok(Record {
+            sid: sid("S-1-5-21-1-2-3-1002"),
+            qualified_name: "dana".into(),
+            kind_found: Kind::Principal,
+            values: vec![Value::Enabled(true), Value::Claims(vec![claim])],
+            withheld: vec![],
+        }));
+        manager.credentials = Some(Ok((
+            Policy::PasswordOrKey,
+            vec![KeyInfo { id: [0xab; 16], fingerprint: "SHA256:abc".into(), label: "laptop".into(), created: 1_791_072_000 }],
+        )));
+        let shown = manager.details(&Typed::default());
+        assert!(shown.contains("<h3>Signs in with</h3><ul class=\"plain\"><li>A password or an SSH key</li></ul>"), "{shown}");
+        assert!(shown.contains("<span>laptop</span><code>SHA256:abc</code>"), "{shown}");
+        assert!(shown.contains(&format!("fx-click=\"remove-key\" fx-value-key=\"{}\"", "ab".repeat(16))), "{shown}");
+        for event in ["add-key", "add-claim", "edit-claim", "remove-claim"] {
+            assert!(shown.contains(&format!("fx-click=\"{event}\"")), "{event}: {shown}");
+        }
+        assert_eq!(manager.account().unwrap().policy, Some(Policy::PasswordOrKey));
+
+        // Someone who may only look sees the claims, and nothing lpsd keeps.
+        manager.authority = Err(format!("You may look, but not change anything. {NEEDS}"));
+        let shown = manager.details(&Typed::default());
+        assert!(shown.contains("Engineering") && !shown.contains("Signs in with") && !shown.contains("add-claim"), "{shown}");
     }
 
     #[test]

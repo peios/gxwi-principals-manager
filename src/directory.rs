@@ -65,6 +65,17 @@ pub struct Directory {
     pub trouble: Option<String>,
 }
 
+impl Directory {
+    /// The SID of the user or group called `name`, with or without its
+    /// domain, in any case.
+    pub fn sid_named(&self, name: &str) -> Option<&str> {
+        let called = |listed: &str| listed.eq_ignore_ascii_case(name) || crate::accounts::short(listed).eq_ignore_ascii_case(name);
+        let users = self.users.iter().filter(|user| called(&user.name)).map(|user| user.sid.as_str());
+        let groups = self.groups.iter().filter(|group| called(&group.name)).map(|group| group.sid.as_str());
+        users.chain(groups).next()
+    }
+}
+
 /// A SID as it is written, or its bytes in hex where they aren't one.
 pub fn sid_text(bytes: &[u8]) -> String {
     match SidRef::from_bytes(bytes) {

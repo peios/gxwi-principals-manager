@@ -13,8 +13,10 @@ use libauthd_client::ident::Ident;
 use libgxwi::{App, Surface};
 
 mod accounts;
+mod claims;
 mod directory;
 mod groups;
+mod keys;
 mod manager;
 mod words;
 
@@ -35,15 +37,20 @@ fn look_again(window: Weak<Surface<Manager>>) {
     loop {
         std::thread::sleep(LOOK_AGAIN);
         let Some(shown) = window.upgrade() else { return };
-        let (ident, picked) = shown.look(|manager, _, _| (manager.ident().clone(), manager.picked().map(str::to_string)));
+        let (ident, admin, picked, user) = shown.look(|manager, _, _| {
+            (manager.ident().clone(), manager.admin().clone(), manager.picked().map(str::to_string), manager.local_user())
+        });
         drop(shown);
         let read = directory::read(&ident);
-        let details = picked.map(|sid| directory::details(&ident, &sid));
+        let details = picked.as_deref().map(|sid| directory::details(&ident, sid));
+        // Keys and how they sign in are lpsd's, asked of it only where this
+        // person may administer it.
+        let credentials = user.map(|name| admin.keys(&name).map_err(|refusal| refusal.reason));
         let Some(shown) = window.upgrade() else { return };
         // An update shows every page the window again, so only one that
         // changes something is made.
-        if shown.look(|manager, _, _| manager.differs(&read, details.as_ref())) {
-            shown.update(|manager, _| manager.heard(read, details));
+        if shown.look(|manager, _, _| manager.differs(&read, picked.as_deref(), details.as_ref(), credentials.as_ref())) {
+            shown.update(|manager, _| manager.heard(read, picked.as_deref(), details, credentials));
         }
     }
 }

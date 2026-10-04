@@ -16,3 +16,5 @@ peios = { git = "https://github.com/peios/peios-rs.git", rev = "3cf23f68d40c4adf
 # this checkout until they are pushed.
 libauthd = { path = "../authd/libauthd" }
 libauthd-client = { path = "../authd/libauthd-client" }
+# The day a key was added, on this machine's clock.
+jiff = "0.2.29"
