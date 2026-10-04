@@ -23,7 +23,7 @@ pub fn render(account: &Account, said: &str) -> String {
         account.called(),
         &format!(
             "<label>Public key<textarea name=\"key\" rows=\"4\" spellcheck=\"false\" fx-autofocus></textarea></label>\
-             <p class=\"hint\">One line of their <code>.pub</code> file, such as <code>~/.ssh/id_ed25519.pub</code>: Ed25519, or RSA of 3072 bits or more.</p>\
+             <p class=\"hint\">One line of their <code>.pub</code> file, such as <code>~/.ssh/id_ed25519.pub</code>: Ed25519, or RSA of 3072 to 8192 bits.</p>\
              <label>Label<input name=\"key-label\" autocomplete=\"off\"></label>\
              <p class=\"hint\">What the key is, such as the machine it is on. Empty, it is the key's own comment.</p>{note}{said}"
         ),
